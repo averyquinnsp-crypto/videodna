@@ -25,7 +25,7 @@ Traditional video breakdown tools only give you a passive forensic report (*"thi
    - **Short-Form Mode (≤ 3 min):** Microscope audit — 0–5s Hook Strip (every 0.5s), hyper-cut detection, pattern-interrupt cadence, loop check.
    - **Long-Form Mode (> 3 min):** Hierarchical Macro Acts + Critical Intro spotlight + Dead-Zone drop-off detector (so even a 60-minute video stays crystal-clear in minimal AI tokens).
 3. **Audience Comment Mining (URL Mode):** Automatically pulls Top 50–100 viewer comments (`yt-dlp`) and separates **Complaints, Unanswered Questions, Part-2 Requests, and Timestamp Callouts** — giving you real viewer proof of what the original missed!
-4. **🚀 Beat-The-Original 10x Upgrade Blueprint:** Diagnoses exact drop-off weaknesses and outputs **3 stronger hook variations**, timestamped pacing surgery, visual/audio upgrades, and remake routing (Google Flow / Veo, HyperFrames / Remotion, Voice-Pro, Kaggle 2K).
+4. **🚀 Beat-The-Original 10x Upgrade Blueprint:** Diagnoses exact drop-off weaknesses and outputs **3 stronger hook variations**, timestamped pacing surgery, visual/audio upgrades, and remake routing (Google Flow / Veo, HyperFrames / Remotion, Cartesia voice, optional Kaggle GPU upscale).
 5. **🧬 Style Vault, Channel Pattern Cracker & Hybrid DNA Fusion:** Save winning videos to your vault, compare multiple videos to extract shared niche formulas (`videodna vault compare`), or fuse Hook A + Pacing B + Audio C (`videodna vault fuse`).
 6. **🔥 Hybrid Termux + Kaggle GPU Support:** Runs instantaneously on phone/PC in Lite Mode, and ships with `kaggle/videodna_deep_gpu.py` for GPU-accelerated **Demucs v4** (vocal/BGM separation) + **Faster-Whisper** (word-level Bengali/English/multilingual transcription).
 
@@ -47,6 +47,24 @@ bash install.sh
 
 > **Requirements:** `python3 >= 3.10`, `ffmpeg` / `ffprobe`, `numpy`, `Pillow`.
 > **Optional (for direct YouTube/Shorts/TikTok URLs + Comment Mining):** `pip install yt-dlp`.
+> **Optional (for local speech transcription):** `pip install 'videodna[transcribe]'` (Faster-Whisper).
+
+---
+
+## What's New in v1.1.0
+
+- **Two-pass shot detection** — `scdet` (hard cuts) + a frame-diff pass (wipes / fades / slides / dissolves) merged, so code-rendered motion graphics no longer read as one long shot. Verified against rea-video's ground truth on the same video.
+- **Silent-aware scoring** — silent videos (motion graphics, text-only demos) are excluded from the audio part of the retention score instead of being punished with 2.0.
+- **Motion-aware dead-zones** — a long shot with hard motion (whip-pans, kinetic type) is no longer flagged as a dead-zone.
+- **Local transcription** — `videodna analyze video.mp4 --transcribe` (Faster-Whisper, optional extra; graceful message when not installed).
+- **Honest forensics** — metadata matching is word-boundary only (no more "wan" inside "taiwan"); `x264`/`mp42` no longer reported as platform signals.
+- **Tighter comment mining** — praise ("what a video!") is no longer counted as a question; bare "more"/"please" no longer counted as requests.
+- **Vault stores views/likes** — `vault compare` reports the top performer by views next to the averaged formula.
+- **Real tool routings** — the skill and review template route to real tools (Cartesia, optional Kaggle upscale); no phantom tool names.
+- **Tests** — 19-test stdlib suite (`python -m unittest discover -s tests -v`), including shot-detection regression tests.
+- Full Apache-2.0 license text.
+
+> **Honest limits:** the retention score is a rule-of-thumb heuristic, not measured audience retention — the telemetry (cuts, ASL, LUFS, dead-air, motion) is the truth. Forensic "AI detection" reads container metadata tags only; re-encoded videos usually have them stripped. The `.cube` LUT is a tonal approximation, not a true color transfer.
 
 ---
 
@@ -56,6 +74,9 @@ bash install.sh
 # 1. Analyze a local MP4 or direct YouTube/Shorts/TikTok URL (auto Short/Long mode)
 videodna analyze /path/to/video.mp4 -o out/my_video --save-vault
 videodna analyze "https://youtube.com/shorts/..." -o out/viral_short --save-vault
+
+# 1b. Transcribe speech locally with Faster-Whisper (optional extra)
+videodna analyze /path/to/video.mp4 --transcribe -o out/my_video
 
 # 2. Zoom into any specific moment (e.g., 2.0s to 4.4s every 0.2s)
 videodna frames /path/to/video.mp4 --start 2.0 --end 4.4 --every 0.2 -o out/my_video/zoom.jpg

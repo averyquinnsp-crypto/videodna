@@ -80,8 +80,8 @@ def _build_review_template(bp: dict[str, Any]) -> dict[str, Any]:
             "remake_tool_routing": {
                 "cinematic_ai_shots": "Google Flow / Veo / Kling",
                 "motion_graphics_and_captions": "HyperFrames / Remotion",
-                "voice_and_mix": "voice-pro (-14 LUFS, tight compression, BGM ducking)",
-                "upscale_and_grade": "Kaggle 2K Upscaler + reference_grade.cube LUT",
+                "voice_and_mix": "Cartesia (or your TTS of choice) — master to -14 LUFS, tight compression, BGM ducking under the voice",
+                "upscale_and_grade": "Optional GPU upscale on Kaggle (only when the user asks) + reference_grade.cube LUT",
             },
         },
         "shot_annotations": [
@@ -106,103 +106,127 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
     c_intel = bp.get("comments_intel") or {}
     review = bp.get("agent_review")
 
-    lines = [
-        f"# VideoDNA Report — `{p['filename']}`",
-        "",
-        "## 1. Executive Telemetry Card",
+    audio_score = d["scores"]["audio_dynamics"]
+    audio_score_txt = f"`{audio_score}`" if audio_score is not None else "`n/a (silent, excluded)`"
+    det = sh.get("detection") or {}
+    det_txt = (
+        f" · Detection: `{det.get('scdet_cuts', '?')} scdet + {det.get('frame_diff_cuts', '?')} frame-diff cuts`"
+        if det else ""
+    )
+
+    # Sections are numbered dynamically so the doc never jumps 4 -> 7 when
+    # the optional comments/review sections are absent.
+    sections: list[tuple[str, list[str]]] = []
+
+    telemetry = [
         f"- **Mode:** `{sh['mode'].upper()}` | **Duration:** `{p['duration_sec']}s` | **Resolution:** `{p['width']}x{p['height']}` (`{p['orientation']}`) | **FPS:** `{p['avg_fps']}` ({'VFR' if p['is_vfr'] else 'CFR'})",
-        f"- **Retention Health Score:** **{d['overall_retention_score']}/10** (Hook: `{d['scores']['hook_velocity']}` · Pacing: `{d['scores']['pacing_health']}` · Audio: `{d['scores']['audio_dynamics']}`)",
-        f"- **Pacing:** `{sh['shot_count']} shots` (`{sh['total_cuts']} cuts`) · Avg Shot Length: `{sh['avg_shot_length_sec']}s` · `{sh['cuts_per_minute']} cuts/min` · Style: `{sh['pacing_style']}`",
+        f"- **Retention Health Score:** **{d['overall_retention_score']}/10** (Hook: `{d['scores']['hook_velocity']}` · Pacing: `{d['scores']['pacing_health']}` · Audio: {audio_score_txt})",
+        f"- *{d.get('score_note', 'Retention scores are rule-of-thumb heuristics, not measured audience retention.')}*",
+        f"- **Pacing:** `{sh['shot_count']} shots` (`{sh['total_cuts']} cuts`) · Avg Shot Length: `{sh['avg_shot_length_sec']}s` · `{sh['cuts_per_minute']} cuts/min` · Style: `{sh['pacing_style']}`{det_txt}",
         f"- **Hook Velocity:** `{sh['hook_cuts_0_3s']}` cuts in 0–3s · `{sh['hook_cuts_0_10s']}` cuts in 0–10s",
         f"- **Audio:** `{a.get('loudness_note', 'N/A')}` · Dead-Air: `{a.get('dead_air_total_sec', 0)}s` · Cut-to-Beat Sync: `{int(a.get('cut_beat_sync_ratio', 0)*100)}%`",
         f"- **Color DNA:** `{v['color_dna']['grade_style']}` · Palette: `{', '.join(v['color_dna']['palette_hex'])}` · LUT: `{v['color_dna']['lut_file']}`",
     ]
-
     if meta.get("title"):
-        lines.append(
+        telemetry.append(
             f"- **Platform Meta:** `{meta.get('platform')}` · **{meta.get('title')}** by `{meta.get('channel')}` "
             f"(Views: `{meta.get('view_count')}` · Likes: `{meta.get('like_count')}`)"
         )
+    if d.get("notes"):
+        for n in d["notes"]:
+            telemetry.append(f"- ℹ️ {n}")
+    sections.append(("Executive Telemetry Card", telemetry))
 
-    lines += ["", "## 2. Forensic & Production Signals"]
+    forensic: list[str] = []
     if p["forensic_signals"]:
         for k, vals in p["forensic_signals"].items():
-            lines.append(f"- `{k}`: {', '.join(vals)}")
+            forensic.append(f"- `{k}`: {', '.join(vals)}")
     else:
-        lines.append("- No explicit editor/AIGC container tags (platform-stripped or clean export — verify visually via `hook_strip.jpg` & `storyboard.jpg`).")
+        forensic.append("- No explicit editor/AIGC container tags (platform-stripped or clean export — verify visually via `hook_strip.jpg` & `storyboard.jpg`).")
     for note in p["cadence_notes"]:
-        lines.append(f"- {note}")
+        forensic.append(f"- {note}")
+    sections.append(("Forensic & Production Signals", forensic))
 
-    lines += ["", "## 3. Structural Acts & Pacing Map"]
-    lines.append("| Act / Phase | Window | Duration | Shots | Cuts/Min |")
-    lines.append("|---|---|---:|---:|---:|")
+    acts = [
+        "| Act / Phase | Window | Duration | Shots | Cuts/Min |",
+        "|---|---|---:|---:|---:|",
+    ]
     for act in sh["macro_acts"]:
-        lines.append(
+        acts.append(
             f"| {act['name']} | {act['start']}s – {act['end']}s | {act['duration']}s | {act['shot_count']} | {act['cuts_per_min']} |"
         )
+    sections.append(("Structural Acts & Pacing Map", acts))
 
-    lines += ["", "## 4. Retention Audit: Strengths, Weaknesses & Beat-The-Original Signals"]
+    audit: list[str] = []
     if d["strengths"]:
-        lines.append("### What Works Well")
+        audit.append("### What Works Well")
         for s in d["strengths"]:
-            lines.append(f"- ✅ {s}")
+            audit.append(f"- ✅ {s}")
     if d["weaknesses"]:
-        lines.append("### Weaknesses / Drop-Off Risks")
+        audit.append("### Weaknesses / Drop-Off Risks")
         for w in d["weaknesses"]:
-            lines.append(f"- ⚠️ **[{w['severity'].upper()}] {w['area']}:** {w['finding']}")
+            audit.append(f"- ⚠️ **[{w['severity'].upper()}] {w['area']}:** {w['finding']}")
     if d["beat_the_original_actions"]:
-        lines.append("### Auto-Detected Ways to Beat This Video")
+        audit.append("### Auto-Detected Ways to Beat This Video")
         for act_txt in d["beat_the_original_actions"]:
-            lines.append(f"- 🚀 {act_txt}")
+            audit.append(f"- 🚀 {act_txt}")
+    sections.append(("Retention Audit: Strengths, Weaknesses & Beat-The-Original Signals", audit))
 
     if c_intel.get("total_mined", 0) > 0:
-        lines += [
-            "",
-            f"## 5. Audience Comment Intelligence ({c_intel['total_mined']} comments mined)",
-            f"- Questions: `{len(c_intel.get('questions', []))}` · Complaints: `{len(c_intel.get('complaints', []))}` · Requests: `{len(c_intel.get('requests', []))}` · Timestamp Callouts: `{len(c_intel.get('timestamp_highlights', []))}`",
-            "- Full comment breakdown: `dna/comments.md`",
-        ]
+        sections.append((
+            f"Audience Comment Intelligence ({c_intel['total_mined']} comments mined)",
+            [
+                f"- Questions: `{len(c_intel.get('questions', []))}` · Complaints: `{len(c_intel.get('complaints', []))}` · Requests: `{len(c_intel.get('requests', []))}` · Timestamp Callouts: `{len(c_intel.get('timestamp_highlights', []))}`",
+                "- Full comment breakdown: `dna/comments.md`",
+            ],
+        ))
 
     if review:
-        lines += [
-            "",
-            "## 6. AI Brain Visual Review & 10x Beat-The-Original Blueprint",
+        rev = [
             f"- **Production Verdict:** {review.get('production_verdict', '')}",
             f"- **Style Bible:** {review.get('visual_style_bible', '')}",
         ]
         sf = review.get("story_formula") or {}
         if sf:
-            lines += [
+            rev += [
                 f"- **Hook (0–3s):** {sf.get('hook_0_3s', '')}",
                 f"- **Core Mechanic:** {sf.get('core_mechanic', '')}",
                 f"- **Reusable Template:** {sf.get('reusable_template', '')}",
             ]
         bto = review.get("beat_the_original") or {}
         if bto.get("stronger_hooks"):
-            lines.append("### Upgraded Hooks (Stronger Than Original)")
+            rev.append("### Upgraded Hooks (Stronger Than Original)")
             for h in bto["stronger_hooks"]:
-                lines.append(f"- 🔥 {h}")
+                rev.append(f"- 🔥 {h}")
         if bto.get("pacing_and_visual_upgrades"):
-            lines.append("### Pacing & Visual Surgery")
+            rev.append("### Pacing & Visual Surgery")
             for u in bto["pacing_and_visual_upgrades"]:
-                lines.append(f"- 🎬 {u}")
+                rev.append(f"- 🎬 {u}")
+        sections.append(("AI Brain Visual Review & 10x Beat-The-Original Blueprint", rev))
 
-    lines += [
-        "",
-        "## 7. Layered File Map (Read On-Demand to Save Tokens)",
-        "| File | Purpose |",
-        "|---|---|",
-        "| `hook_strip.jpg` | Visual strip of the critical opening seconds (inspect FIRST!) |",
-        "| `storyboard.jpg` | Labeled contact sheet of key shots with timestamps & motion classes |",
-        "| `audio_timeline.png` | Audio energy curve + red dead-air zones + yellow visual cut ticks |",
-        "| `reference_grade.cube` | Auto-generated 3D color LUT matching the reference tonal grade |",
-        "| `dna/shots.md` | Full shot-by-shot table + dead-zone list |",
-        "| `dna/transcript.md` | Timestamped spoken script (if available) |",
-        "| `dna/comments.md` | Audience questions, complaints, requests & timestamp highlights |",
-        "| `report.html` | Interactive visual dashboard for humans |",
-        "| `blueprint.json` | Complete machine-readable JSON for automated remake pipelines |",
-    ]
-    return "\n".join(lines) + "\n"
+    sections.append((
+        "Layered File Map (Read On-Demand to Save Tokens)",
+        [
+            "| File | Purpose |",
+            "|---|---|",
+            "| `hook_strip.jpg` | Visual strip of the critical opening seconds (inspect FIRST!) |",
+            "| `storyboard.jpg` | Labeled contact sheet of key shots with timestamps & motion classes |",
+            "| `audio_timeline.png` | Audio energy curve + red dead-air zones + yellow visual cut ticks |",
+            "| `reference_grade.cube` | Auto-generated 3D color LUT matching the reference tonal grade |",
+            "| `dna/shots.md` | Full shot-by-shot table + dead-zone list |",
+            "| `dna/transcript.md` | Timestamped spoken script (if available) |",
+            "| `dna/comments.md` | Audience questions, complaints, requests & timestamp highlights |",
+            "| `report.html` | Interactive visual dashboard for humans |",
+            "| `blueprint.json` | Complete machine-readable JSON for automated remake pipelines |",
+        ],
+    ))
+
+    lines = [f"# VideoDNA Report — `{p['filename']}`", ""]
+    for idx, (title, body) in enumerate(sections, start=1):
+        lines.append(f"## {idx}. {title}")
+        lines.extend(body)
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _render_shots_md(bp: dict[str, Any]) -> str:
@@ -260,7 +284,7 @@ def _render_comments_md(bp: dict[str, Any]) -> str:
 def _render_transcript_md(bp: dict[str, Any]) -> str:
     tr = bp.get("transcript") or []
     if not tr:
-        return "# Transcript\n\nNo subtitle/transcript track available in Lite mode. Use URL ingest or Kaggle Deep GPU mode (WhisperX) for word-level transcription.\n"
+        return "# Transcript\n\nNo subtitle/transcript track available. Use URL ingest (yt-dlp subtitles), `--transcribe` (local Faster-Whisper, optional extra), or Kaggle Deep GPU mode (Faster-Whisper) for transcription.\n"
     lines = ["# Timestamped Transcript", ""]
     for row in tr:
         lines.append(f"- **[{row['start']:.1f}s – {row['end']:.1f}s]** {row['text']}")
@@ -372,6 +396,7 @@ def _render_html_report(bp: dict[str, Any]) -> str:
 
   <section class="card">
     <h2>🚀 Beat-The-Original Diagnostic Scorecard</h2>
+    <p style="color:var(--muted);font-size:0.85rem;">{html.escape(d.get('score_note', ''))}</p>
     <h3>What Works Well</h3><ul>{str_html}</ul>
     <h3>Weaknesses & Drop-Off Leaks</h3><ul>{weak_html}</ul>
     <h3>Concrete Upgrade Actions</h3><ul>{up_html}</ul>

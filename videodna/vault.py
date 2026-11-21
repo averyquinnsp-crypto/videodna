@@ -20,10 +20,15 @@ def save_to_vault(blueprint: dict[str, Any], name: str | None = None, vault_dir:
     raw_name = name or (blueprint.get("platform_meta") or {}).get("title") or blueprint["probe"]["filename"]
     slug = _slug(raw_name)
     target = vault_dir / f"{slug}.json"
-    # Store compact DNA snapshot
+    # Store compact DNA snapshot (performance metrics included so `compare`
+    # can actually tie patterns to what performed, not just average them).
+    meta = blueprint.get("platform_meta") or {}
     compact = {
         "name": slug,
-        "title": (blueprint.get("platform_meta") or {}).get("title") or blueprint["probe"]["filename"],
+        "title": meta.get("title") or blueprint["probe"]["filename"],
+        "view_count": meta.get("view_count"),
+        "like_count": meta.get("like_count"),
+        "comment_count": meta.get("comment_count"),
         "mode": blueprint["shots"]["mode"],
         "duration_sec": blueprint["probe"]["duration_sec"],
         "orientation": blueprint["probe"]["orientation"],
@@ -77,9 +82,23 @@ def crack_channel_patterns(vault_dir: Path = DEFAULT_VAULT) -> dict[str, Any]:
     top_grade = max(grades, key=grades.get)
     top_pacing = max(pacings, key=pacings.get)
 
+    # Top performer by views (when URL metadata was available) — the formula
+    # below is only meaningful next to what actually performed.
+    with_views = [x for x in items if x.get("view_count") is not None]
+    top_by_views = None
+    if with_views:
+        best = max(with_views, key=lambda x: float(x["view_count"]))
+        top_by_views = {
+            "name": best["name"],
+            "title": best.get("title"),
+            "view_count": best["view_count"],
+            "retention_score": best.get("retention_score"),
+        }
+
     return {
         "count": len(items),
         "videos": [x["name"] for x in items],
+        "top_by_views": top_by_views,
         "niche_formula": {
             "avg_duration_sec": _avg("duration_sec"),
             "avg_shot_length_sec": _avg("avg_shot_length_sec"),

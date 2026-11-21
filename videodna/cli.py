@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -14,7 +15,7 @@ from typing import Any
 from videodna import __version__
 from videodna.audio import analyze_audio
 from videodna.diagnostics import compute_diagnostics
-from videodna.ingest import ingest_url, is_url, parse_subtitle_file
+from videodna.ingest import find_yt_dlp, ingest_url, is_url, parse_subtitle_file, transcribe_local
 from videodna.probe import probe_video
 from videodna.report import write_outputs
 from videodna.shots import detect_shots
@@ -60,7 +61,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     mode = probe["recommended_mode"] if args.mode == "auto" else args.mode
 
     print(f"[VideoDNA] 2/4 Detecting shots & pacing (mode={mode}, duration={probe['duration_sec']}s)...")
-    shots = detect_shots(video_path, probe["duration_sec"], mode=mode, threshold=args.threshold)
+    shots = detect_shots(
+        video_path, probe["duration_sec"], mode=mode, threshold=args.threshold,
+        width=probe["width"], height=probe["height"],
+    )
 
     print(f"[VideoDNA] 3/4 Extracting keyframes, motion energy, color DNA & 3D .cube LUT...")
     visual = analyze_visuals(video_path, shots, out_dir, mode=mode)
@@ -68,7 +72,13 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     print(f"[VideoDNA] 4/4 Analyzing audio loudness (LUFS), dead-air, beat/SFX transients...")
     audio = analyze_audio(video_path, probe["duration_sec"], shots["shots"], out_dir, has_audio=probe["has_audio"])
 
+    if args.transcribe and probe["has_audio"] and not transcript:
+        transcript = transcribe_local(video_path, model=args.transcribe_model)
+
     diagnostics = compute_diagnostics(probe, shots, visual, audio, comments_intel=comments_intel)
+    # Use the motion-aware dead-zone list everywhere (shots.md, CLI summary)
+    # so a high-motion long shot is never reported as dead.
+    shots["dead_zones"] = diagnostics["effective_dead_zones"]
 
     blueprint: dict[str, Any] = {
         "schema_version": "videodna/1.0",
@@ -95,7 +105,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     print(f"Retention Score: {diagnostics['overall_retention_score']}/10")
     print(f"Shots / ASL:     {shots['shot_count']} shots | Avg {shots['avg_shot_length_sec']}s | {shots['cuts_per_minute']} cuts/min")
     print(f"Dead-Zones:      {len(shots['dead_zones'])}")
-    print(f"Audio Loudness:  {audio.get('integrated_lufs')} LUFS | Sync: {int(audio.get('cut_beat_sync_ratio', 0)*100)}%")
+    lufs_display = audio.get("integrated_lufs")
+    lufs_txt = f"{lufs_display} LUFS" if lufs_display is not None else "N/A (silent)"
+    print(f"Audio Loudness:  {lufs_txt} | Sync: {int(audio.get('cut_beat_sync_ratio', 0)*100)}%")
     print(f"DNA Brief (AI):  {paths['dna_md']}")
     print(f"HTML Dashboard:  {paths['report_html']}")
     print(f"Review Template: {paths['agent_review_template']}")
@@ -124,13 +136,23 @@ def cmd_apply_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tile_dims(n_frames: int) -> tuple[int, int]:
+    """Smallest near-square tile grid holding n_frames (caps at 8x8 = 64)."""
+    n = max(1, min(n_frames, 64))
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    return cols, rows
+
+
 def cmd_frames(args: argparse.Namespace) -> int:
     """Extract zoomed micro-frames between start and end seconds for forensic inspection."""
     video_path = Path(args.video).expanduser().resolve()
     out_path = Path(args.output).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fps_expr = f"fps=1/{max(0.05, args.every)}"
-    vf = f"scale=320:-2,{fps_expr},tile=4x3"
+    n_frames = max(1, int((args.end - args.start) / max(0.05, args.every)) + 1)
+    cols, rows = _tile_dims(n_frames)
+    vf = f"scale=320:-2,{fps_expr},tile={cols}x{rows}"
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", str(args.start), "-to", str(args.end),
@@ -169,10 +191,12 @@ def cmd_vault(args: argparse.Namespace) -> int:
 
 def cmd_doctor(_args: argparse.Namespace) -> int:
     print(f"VideoDNA v{__version__} Environment Check:")
-    for tool in ("ffmpeg", "ffprobe", "yt-dlp", "git"):
+    for tool in ("ffmpeg", "ffprobe", "git"):
         path = shutil.which(tool)
-        status = f"OK ({path})" if path else "MISSING (optional for local MP4)" if tool == "yt-dlp" else "MISSING"
+        status = f"OK ({path})" if path else "MISSING"
         print(f"  - {tool:8s}: {status}")
+    yt_dlp_cmd = find_yt_dlp()
+    print(f"  - yt-dlp  : {'OK (' + ' '.join(yt_dlp_cmd) + ')' if yt_dlp_cmd else 'MISSING (optional for local MP4)'}")
     for mod in ("numpy", "PIL", "requests"):
         try:
             __import__(mod)
@@ -196,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--mode", choices=["auto", "short", "long"], default="auto", help="Analysis mode.")
     pa.add_argument("--threshold", type=float, default=None, help="Override ffmpeg scdet cut threshold.")
     pa.add_argument("--transcript", help="Optional local .srt/.vtt subtitle file.")
+    pa.add_argument("--transcribe", action="store_true", help="Transcribe speech locally with Faster-Whisper (optional extra: pip install 'videodna[transcribe]'). Skipped when a transcript already exists.")
+    pa.add_argument("--transcribe-model", default="base", help="Faster-Whisper model: tiny/base/small/medium/large-v3 (default: base).")
     pa.add_argument("--max-comments", type=int, default=80, help="Max audience comments to mine on URL input.")
     pa.add_argument("--sub-langs", default="en,bn,hi", help="Subtitle languages for yt-dlp.")
     pa.add_argument("--save-vault", action="store_true", help="Save DNA snapshot into Style Vault.")

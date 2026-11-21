@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "videodna"
-version = "1.0.0"
+version = "1.1.0"
 description = "10x Video Reverse-Engineering, Viral Retention X-Ray & Beat-The-Original Blueprint Engine for Short & Long Videos."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,7 +29,8 @@ dependencies = [
 [project.optional-dependencies]
 url = ["yt-dlp>=2024.8.0"]
 ai = ["requests>=2.28"]
-all = ["yt-dlp>=2024.8.0", "requests>=2.28"]
+transcribe = ["faster-whisper>=1.0.0"]
+all = ["yt-dlp>=2024.8.0", "requests>=2.28", "faster-whisper>=1.0.0"]
 
 [project.scripts]
 videodna = "videodna.cli:main"

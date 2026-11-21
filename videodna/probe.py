@@ -22,9 +22,29 @@ SOFTWARE_SIGNATURES = {
     ],
     "platform_reencode": [
         "tiktok", "douyin", "instagram", "facebook", "fbcdn", "youtube",
-        "wechat", "x264", "iso5", "mp42",
+        "wechat",
     ],
 }
+
+
+def match_signatures(blob: str) -> dict[str, list[str]]:
+    """Match forensic keyword signatures against a lowercase metadata blob.
+
+    Word-boundary regex ONLY — plain substring matching false-positives
+    (e.g. "wan" inside "taiwan"). The trailing lookahead allows version
+    suffixes ("veo3") but not longer words ("wanda"). Multi-word keywords
+    ("after effects") match on their first/last word boundaries.
+    """
+    blob = blob.lower()
+    detected: dict[str, list[str]] = {}
+    for category, keywords in SOFTWARE_SIGNATURES.items():
+        hits = [
+            kw for kw in keywords
+            if re.search(rf"\b{re.escape(kw)}(?![a-z])", blob)
+        ]
+        if hits:
+            detected[category] = hits
+    return detected
 
 
 def _parse_ratio(rate_str: str) -> float:
@@ -101,11 +121,7 @@ def probe_video(video_path: Path) -> dict[str, Any]:
             all_tags[f"audio.{k}"] = str(v)
 
     blob = " ".join(f"{k}={v}" for k, v in all_tags.items()).lower()
-    detected_signals: dict[str, list[str]] = {}
-    for category, keywords in SOFTWARE_SIGNATURES.items():
-        hits = [kw for kw in keywords if re.search(rf"\b{re.escape(kw)}", blob) or kw in blob]
-        if hits:
-            detected_signals[category] = hits
+    detected_signals = match_signatures(blob)
 
     # Cadence clues (AI video generators often output 24fps or 16fps/8fps-upsampled, screen caps VFR)
     cadence_notes: list[str] = []

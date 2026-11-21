@@ -101,12 +101,12 @@ Always respond in the **user's language** (Bengali, English, etc.) with these cr
    - **Pacing & Visual Surgery** (exact timestamps to tighten, add kinetic callouts, B-roll metaphors, or SFX risers).
    - **Audio Upgrade** (exact LUFS / ducking / dead-air fixes).
 4. **🛠️ Actionable Remake Routing (Plug Straight Into Your Tools):**
-   - Route each shot type cleanly to the user's real stack:
+   - Route each shot type cleanly to the user's real stack — never invent a tool name:
      - AI Cinematic Shots → **Google Flow / Veo / Kling** (with shot-level prompts & style consistency rules)
      - Motion Graphics / Captions / Charts → **HyperFrames / Remotion**
-     - 2D / Stickman Explainers → **Stickman / Canvas Pipeline**
-     - Voice & Mix → **voice-pro** (`-14 LUFS`, tight compression, BGM ducking)
-     - Final Polish → **Kaggle 2K Upscaler** + auto-generated `reference_grade.cube` LUT
+     - 2D Animation → the user's own 2D pipeline (ask which tool they use — never assume a named pipeline exists)
+     - Voice & Mix → **Cartesia TTS** (or the user's TTS of choice) — master to `-14 LUFS`, tight compression, BGM ducking under the voice
+     - Final Polish → optional GPU upscale on Kaggle (only when the user asks) + auto-generated `reference_grade.cube` LUT
      - Live Shots → Exact camera & lighting shooting plan.
 
 ---
@@ -131,3 +131,13 @@ This permanently upgrades both `DNA.md` and the interactive `report.html` dashbo
   ```bash
   videodna vault fuse --hook <vidA> --pacing <vidB> --audio <vidC>
   ```
+
+---
+
+## 6. Honest Limits (Say These Out Loud When They Apply)
+
+- **The retention score is a heuristic**, not measured audience retention. It is a fixed-ladder summary of hook cuts, pacing, and audio. Report the underlying telemetry (cuts, ASL, LUFS, dead-air, motion) alongside any score, and never present the score as a verdict on its own. Silent videos are excluded from the audio part of the score by design.
+- **Shot detection is two-pass** (`scdet` for hard cuts + frame-diff for wipes/fades/slides) and still misses very subtle transitions. If the storyboard shows a visual change the shot table missed, trust your eyes and say so.
+- **"AI/forensics" signals come from container metadata tags only.** Downloaded/re-encoded videos usually have them stripped — no signal means "unknown", not "definitely live-action".
+- **Comment buckets are keyword-based**, not semantic. Skim the raw comments in `dna/comments.md` before quoting a bucket as fact.
+- **The `.cube` LUT is a tonal approximation** (contrast/saturation/tint from the reference's mean/std), not a true color transfer. It is a starting grade, not a match.

@@ -12,12 +12,33 @@ def compute_diagnostics(
     audio: dict[str, Any],
     comments_intel: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Score retention signals and flag concrete opportunities to beat the reference video."""
+    """Score retention signals and flag concrete opportunities to beat the reference video.
+
+    Scores are RULE-OF-THUMB heuristics (fixed ladders + weights), not measured
+    retention — the returned telemetry is the truth, the score is a summary.
+    """
     mode = shots["mode"]
     duration = max(0.1, probe["duration_sec"])
     weaknesses: list[dict[str, str]] = []
     strengths: list[str] = []
     upgrade_actions: list[str] = []
+    notes: list[str] = []
+
+    # 0. Effective dead-zones: a long shot is only a dead-zone if it is ALSO
+    # visually quiet. A long shot with hard motion (whip-pans, kinetic type,
+    # slides, zooms) holds attention — flagging it as dead is a false positive.
+    motion_by_shot = {
+        v["shot_id"]: v.get("motion_class", "unknown")
+        for v in visual.get("shot_visuals", [])
+    }
+    effective_dead_zones: list[dict[str, Any]] = []
+    for dz in shots["dead_zones"]:
+        mc = motion_by_shot.get(dz["shot_id"], "unknown")
+        if mc in ("dynamic_action", "high_energy_whip"):
+            continue  # moving hard — not dead
+        if mc == "gentle_motion" and dz["severity"] == "high":
+            dz = {**dz, "severity": "medium"}
+        effective_dead_zones.append(dz)
 
     # 1. Hook Velocity Score (0-10)
     hook_cuts_3s = shots["hook_cuts_0_3s"]
@@ -57,7 +78,7 @@ def compute_diagnostics(
             )
 
     # 2. Pacing & Dead-Zone Score (0-10)
-    dead_zones = shots["dead_zones"]
+    dead_zones = effective_dead_zones
     asl = shots["avg_shot_length_sec"]
     static_ratio = visual["motion_summary"]["static_shot_ratio"]
 
@@ -88,12 +109,21 @@ def compute_diagnostics(
         )
 
     # 3. Audio Dynamics & Loudness Score (0-10)
-    audio_score = 8.0
-    if not audio.get("has_audio"):
-        audio_score = 2.0
-        weaknesses.append({"area": "Audio", "severity": "high", "finding": "No audio track detected."})
+    # Silence is often INTENTIONAL (motion graphics, text-only demos, title
+    # cards). Scoring a silent video 2.0 punishes the format, so silent audio
+    # is excluded from the overall score instead of treated as a failure.
+    lufs = audio.get("integrated_lufs")
+    silent_track = (not audio.get("has_audio")) or (lufs is not None and lufs < -50.0)
+    audio_excluded = False
+    audio_score: float | None = 8.0
+    if silent_track:
+        audio_score = None
+        audio_excluded = True
+        notes.append(
+            "Silent video (no audible audio track) — audio excluded from the "
+            "retention score; silence may be intentional (e.g. motion-graphics demo)."
+        )
     else:
-        lufs = audio.get("integrated_lufs")
         if lufs is not None and lufs < -20.0:
             audio_score -= 2.5
             weaknesses.append({
@@ -102,7 +132,7 @@ def compute_diagnostics(
                 "finding": f"Under-leveled audio ({lufs} LUFS) — sounds weak compared to -14 LUFS viral standard.",
             })
             upgrade_actions.append(
-                "AUDIO UPGRADE: Master voice & BGM to -14 LUFS with tight compression and -12dB BGM ducking (voice-pro preset)."
+                "AUDIO UPGRADE: Master voice & BGM to -14 LUFS with tight compression and BGM ducking under the voice."
             )
         elif lufs is not None and -16.5 <= lufs <= -12.0:
             strengths.append(f"Broadcast-ready loudness ({lufs} LUFS).")
@@ -143,14 +173,26 @@ def compute_diagnostics(
                 f"CAPTURE DEMAND: {len(comments_intel['requests'])} viewer request(s)/Part-2 asks detected — turn the #1 request into your hook or bonus payoff."
             )
 
-    overall = round((hook_score * 0.35 + pacing_score * 0.35 + audio_score * 0.30), 1)
+    if audio_excluded:
+        overall = round((hook_score * 0.5 + pacing_score * 0.5), 1)
+    else:
+        overall = round((hook_score * 0.35 + pacing_score * 0.35 + (audio_score or 0.0) * 0.30), 1)
 
     return {
         "overall_retention_score": overall,
+        "score_method": "heuristic",
+        "score_note": (
+            "Retention scores are rule-of-thumb heuristics (fixed ladders + weights), "
+            "not measured audience retention. Treat the underlying telemetry "
+            "(cuts, ASL, LUFS, dead-air, motion) as the truth."
+        ),
+        "audio_excluded_from_score": audio_excluded,
+        "effective_dead_zones": effective_dead_zones,
+        "notes": notes,
         "scores": {
             "hook_velocity": round(hook_score, 1),
             "pacing_health": round(pacing_score, 1),
-            "audio_dynamics": round(audio_score, 1),
+            "audio_dynamics": round(audio_score, 1) if audio_score is not None else None,
         },
         "strengths": strengths,
         "weaknesses": weaknesses,

@@ -66,6 +66,15 @@ def analyze_audio(
     for idx, (e, d) in enumerate(ends):
         s = starts[idx] if idx < len(starts) else max(0.0, e - d)
         dead_air.append({"start": round(s, 2), "end": round(e, 2), "duration": round(d, 2)})
+    # Trailing silence: silencedetect emits silence_start without a matching
+    # silence_end when the file ends mid-silence — count it to EOF.
+    if len(starts) > len(ends):
+        s = starts[-1]
+        dead_air.append({
+            "start": round(s, 2),
+            "end": round(duration, 2),
+            "duration": round(max(0.0, duration - s), 2),
+        })
     dead_air_total = round(sum(x["duration"] for x in dead_air), 2)
 
     # 3. Energy Envelope & Transient (SFX/Beat Hit) Detection via 8kHz mono PCM
@@ -131,10 +140,12 @@ def analyze_audio(
     else:
         compact_curve = energy_db
 
-    # Loudness verdict (directly maps to voice-pro target -14 LUFS)
+    # Loudness verdict (production target: -14 LUFS for Shorts/YouTube)
     loudness_note = "unknown"
     if integrated_lufs is not None:
-        if integrated_lufs < -20.0:
+        if integrated_lufs < -50.0:
+            loudness_note = f"silent track ({integrated_lufs} LUFS — no audible audio; silence may be intentional)"
+        elif integrated_lufs < -20.0:
             loudness_note = f"too_quiet ({integrated_lufs} LUFS — target -14 LUFS for Shorts/YouTube)"
         elif integrated_lufs <= -12.0:
             loudness_note = f"optimal_streaming_loudness ({integrated_lufs} LUFS)"
