@@ -42,6 +42,12 @@ MODEL_CAPABILITIES: dict[str, dict[str, Any]] = {
         "cost_tier": "free_local",
         "strategy": "Generate high-res still images once, then animate smooth scale/pan/parallax curves in code.",
     },
+    "unknown": {
+        "recommended_tool": "Visual review first — classify the shot, then route it",
+        "max_batch_sec": 8.0,
+        "cost_tier": "review_first",
+        "strategy": "No forensic signal fired for these shots — inspect them visually, set the real production type in the agent review, then re-run apply-review to re-batch.",
+    },
 }
 
 
@@ -83,18 +89,20 @@ def build_remake_plan(
                 "strategy": cap["strategy"],
             })
 
-    # Audio & Finish routing
+    # Audio & Finish routing (real tools only — no phantom names)
     audio_type = audio.get("audio_type", "unknown")
     if audio_type == "silent_no_audio":
-        audio_plan = "Original track is SILENT — add fresh studio voiceover + dark/matching BGM + beat-synced SFX mastered to -14 LUFS via voice-pro."
+        audio_plan = "Original track is SILENT — add fresh studio voiceover + dark/matching BGM + beat-synced SFX mastered to -14 LUFS with Cartesia voice (or your TTS of choice)."
+    elif audio_type == "test_tone":
+        audio_plan = "Original audio is a pure test tone / drone (no real content) — add fresh voiceover + BGM mastered to -14 LUFS with Cartesia voice (or your TTS of choice)."
     elif audio_type == "music_only":
         audio_plan = f"Music-driven edit (est. {audio.get('estimated_bpm') or 'N/A'} BPM) — source/generate copyright-safe track matching BPM and align cuts to beats."
     else:
-        audio_plan = f"Voice + BGM pipeline — record/clone narration and master via voice-pro (-14 LUFS, tight compression, -12dB BGM ducking)."
+        audio_plan = "Voice + BGM pipeline — record/clone narration with Cartesia (or your TTS of choice) and master to -14 LUFS (tight compression, -12dB BGM ducking)."
 
     return {
         "total_batches": len(batches),
         "batches": batches,
         "audio_pipeline": audio_plan,
-        "color_pipeline": f"Apply auto-generated LUT `{color_dna.get('lut_file')}` ({color_dna.get('grade_style')}) + final 2K polish via Kaggle GPU Upscaler.",
+        "color_pipeline": f"Apply auto-generated LUT `{color_dna.get('lut_file')}` ({color_dna.get('grade_style')}) + optional GPU upscale on Kaggle (only when the user asks).",
     }

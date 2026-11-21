@@ -31,6 +31,14 @@ def _estimate_bpm(samples: np.ndarray, sr: int) -> tuple[float | None, float]:
     mat = seg[: n_frames * hop].reshape(n_frames, hop)
     energy = np.sqrt(np.mean(mat ** 2, axis=1) + 1e-10)
     onset = np.maximum(0.0, np.diff(energy, prepend=energy[0]))
+    # A beat needs real onsets: count jumps of at least 10% of the average
+    # frame energy. A steady tone/drone has only micro-variation, and its
+    # periodic envelope autocorrelates spuriously — v2.0 reported BPM 120
+    # on a pure 440Hz sine. Fewer than 4 real onsets => no BPM.
+    onset_floor = 0.10 * float(np.mean(energy))
+    n_real_onsets = int(np.sum(onset > onset_floor))
+    if n_real_onsets < 4:
+        return None, 0.0
     onset = onset - onset.mean()
     if np.std(onset) < 1e-5:
         return None, 0.0
@@ -81,6 +89,15 @@ def _classify_audio_content(
     speech_e = float(np.sum(mean_spec[(freqs >= 300) & (freqs <= 3200)])) / total_e
     high_e = float(np.sum(mean_spec[freqs > 3200])) / total_e
 
+    # Tonality: a near-pure tone (test signal / drone) concentrates almost
+    # all energy in one spectral bin and has near-zero spectral flatness.
+    # Without this check a 440Hz sine looks like "speech" (its energy sits
+    # inside the 300-3200Hz speech band) and spurious BPM pushes it to
+    # speech_plus_bgm (v2.0 bug) — so test for tone FIRST.
+    dominant_bin_ratio = float(np.max(mean_spec)) / total_e
+    log_spec = np.log(mean_spec + 1e-12)
+    spectral_flatness = float(np.exp(np.mean(log_spec)) / (np.mean(mean_spec) + 1e-12))
+
     # Frame energy variability (speech modulates strongly between syllables; steady music is flatter)
     rms_f = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-10)
     low_energy_frac = float(np.mean(rms_f < (np.percentile(rms_f, 80) * 0.20)))
@@ -90,7 +107,12 @@ def _classify_audio_content(
         "speech_band_ratio": round(speech_e, 3),
         "high_band_ratio": round(high_e, 3),
         "modulation_pause_ratio": round(low_energy_frac, 3),
+        "dominant_bin_ratio": round(dominant_bin_ratio, 3),
+        "spectral_flatness": round(spectral_flatness, 4),
     }
+
+    if dominant_bin_ratio >= 0.45 or spectral_flatness < 0.005:
+        return "test_tone", feats
 
     if speech_e >= 0.58 and bass_e < 0.22 and (low_energy_frac >= 0.14 or dead_air_ratio >= 0.05):
         return "speech_only", feats
@@ -215,6 +237,15 @@ def analyze_audio(
     for idx, (e, d) in enumerate(ends):
         s = starts[idx] if idx < len(starts) else max(0.0, e - d)
         dead_air.append({"start": round(s, 2), "end": round(e, 2), "duration": round(d, 2)})
+    # Trailing silence: silencedetect emits silence_start without a matching
+    # silence_end when the file ends mid-silence — count it to EOF.
+    if len(starts) > len(ends):
+        s = starts[-1]
+        dead_air.append({
+            "start": round(s, 2),
+            "end": round(duration, 2),
+            "duration": round(max(0.0, duration - s), 2),
+        })
     dead_air_total = round(sum(x["duration"] for x in dead_air), 2)
     dead_air_ratio = dead_air_total / max(duration, 0.1)
 
@@ -246,6 +277,10 @@ def analyze_audio(
     # 5. BPM & Audio Content Classification
     bpm, bpm_conf = _estimate_bpm(samples, sr)
     audio_type, spec_feats = _classify_audio_content(samples, sr, dead_air_ratio, bpm_conf)
+    # BPM is only meaningful for music; speech / ambient / test-tone tracks
+    # get no BPM even if the onset envelope shows spurious periodicity.
+    if audio_type not in ("music_only", "speech_plus_bgm"):
+        bpm, bpm_conf = None, 0.0
 
     # 6. Cut-to-Beat Sync Score
     synced_cuts = sum(1 for ct in cut_times if any(abs(tr["t"] - ct) <= 0.30 for tr in transients))

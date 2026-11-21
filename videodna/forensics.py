@@ -196,15 +196,24 @@ def _score_shot_metrics(
     probs_arr = vals / vals.sum()
     probs = {k: round(float(p), 3) for k, p in zip(CATEGORIES, probs_arr)}
 
-    top_label = max(probs, key=probs.get)
-    top_prob = probs[top_label]
-    # Honest offline calibration: never claim >88% before visual agent review
     sorted_p = sorted(probs.values(), reverse=True)
     margin = sorted_p[0] - (sorted_p[1] if len(sorted_p) > 1 else 0.0)
-    confidence = round(float(np.clip(top_prob * 0.78 + margin * 0.28, 0.30, 0.88)), 2)
-
-    if not evidence:
-        evidence.append("Balanced visual profile (platform re-encoding may reduce forensic contrast — verify visually).")
+    # Honest offline calibration: never claim >88% before visual agent review.
+    # If NO rule fired, all classes tie at 1/6 and max() would silently pick
+    # the first label ("live") — a pure dict-order artifact (v2.0 bug: it
+    # reported "live 41%" on a video with no live footage). A tie or a
+    # near-tie is "unknown", never a confident-sounding class.
+    if not evidence or margin < 0.005:
+        top_label = "unknown"
+        confidence = 0.30
+        if not evidence:
+            evidence.append("No forensic rule fired — flat/uniform profile, classify visually (unknown).")
+        else:
+            evidence.append("Top classes nearly tied — classify visually (unknown).")
+    else:
+        top_label = max(probs, key=probs.get)
+        top_prob = probs[top_label]
+        confidence = round(float(np.clip(top_prob * 0.78 + margin * 0.28, 0.30, 0.88)), 2)
 
     return probs, top_label, confidence, evidence
 

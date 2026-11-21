@@ -78,10 +78,15 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(_tile_dims(100), (8, 8))  # capped at 64 frames
 
     def test_find_yt_dlp(self):
+        # yt-dlp is installed in the dev venv; discovery must find it even
+        # when the venv bin dir is not on PATH (the v1.0 bug). The check
+        # must stay strict — a weak "pass if missing" test hides exactly
+        # the regression it exists to catch (v2.0 weakened it; v2.0.1
+        # restores the assertion).
         found = find_yt_dlp()
-        if found is not None:
-            self.assertIsInstance(found, list)
-            self.assertGreaterEqual(len(found), 1)
+        self.assertIsNotNone(found)
+        self.assertIsInstance(found, list)
+        self.assertGreaterEqual(len(found), 1)
 
 
 class TestProbeSignatures(unittest.TestCase):
@@ -292,6 +297,126 @@ class TestVideoDNAv2ForensicsAndRemake(unittest.TestCase):
         subprocess.run(["videodna", "apply-review", str(out)], check=True, capture_output=True)
         subprocess.run(["videodna", "moments", str(out)], check=True, capture_output=True)
         self.assertTrue((out / "dna" / "remake_plan.md").exists())
+
+
+class TestVideoDNAv201Regressions(unittest.TestCase):
+    """v2.0.1 fixes: audio classifier tone bug, forensics tie-break,
+    phantom tool names, trailing silence, review-template routing."""
+
+    def setUp(self) -> None:
+        import os
+        base_tmp = os.environ.get("TMPDIR") or tempfile.gettempdir()
+        self.tmp = Path(tempfile.mkdtemp(prefix="videodna_v201_qa_", dir=base_tmp))
+
+    def tearDown(self) -> None:
+        import shutil
+        if self.tmp.exists():
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_video(self, name: str, audio_filter: str, dur: float = 6.0) -> Path:
+        """Static dark frame + a generated audio track."""
+        import subprocess
+        vid = self.tmp / name
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"color=c=#202020:s=640x360:d={dur}:r=30",
+            "-f", "lavfi", "-i", audio_filter,
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-shortest", "-y", str(vid),
+        ], check=True)
+        return vid
+
+    def test_pure_440hz_tone_is_test_tone_not_speech_plus_bgm(self) -> None:
+        # v2.0 bug: a pure 440Hz sine (no speech, no beat) was classified
+        # speech_plus_bgm with BPM 120. A tone must be test_tone, no BPM.
+        import subprocess
+        vid = self._make_video("tone440.mp4", "sine=frequency=440:duration=6")
+        out = self.tmp / "out_tone"
+        subprocess.run(["videodna", "analyze", str(vid), "-o", str(out)],
+                       check=True, capture_output=True)
+        bp = json.loads((out / "blueprint.json").read_text(encoding="utf-8"))
+        self.assertEqual(bp["audio"]["audio_type"], "test_tone")
+        self.assertIsNone(bp["audio"]["estimated_bpm"])
+        self.assertEqual(bp["audio"]["bpm_confidence"], 0.0)
+        self.assertGreaterEqual(
+            bp["audio"]["spectral_features"]["dominant_bin_ratio"], 0.45
+        )
+
+    def test_forensics_tie_is_unknown_not_live(self) -> None:
+        # v2.0 bug: when no forensic rule fires, all 6 classes tie at 1/6
+        # and max() silently picks the first label ("live") — a pure
+        # dict-order artifact. A tie must be "unknown".
+        from videodna.forensics import _score_shot_metrics
+        neutral = {
+            "sensor_noise": 2.0,
+            "flat_region_ratio": 0.25,
+            "rectilinear_edge_ratio": 0.05,
+            "extreme_bw_ratio": 0.10,
+            "color_entropy": 0.50,
+            "mean_frame_diff": 2.0,
+            "duplicate_frame_ratio": 0.0,
+            "planar_coherence": 0.10,
+        }
+        probs, top_label, conf, evidence = _score_shot_metrics(
+            neutral, {"forensic_signals": {}, "is_vfr": False, "avg_fps": 30}
+        )
+        self.assertEqual(top_label, "unknown")
+        self.assertLess(conf, 0.65)
+        self.assertTrue(all(abs(p - 1 / 6) < 0.01 for p in probs.values()))
+
+    def test_trailing_silence_counted_to_eof(self) -> None:
+        # v1.1.0 fix dropped in v2.0: silencedetect emits silence_start
+        # without a matching silence_end when the file ends mid-silence.
+        # 2s tone + 2s trailing silence must count ~2s of dead air.
+        import subprocess
+        vid = self._make_video(
+            "trailing.mp4",
+            "sine=frequency=440:duration=2,apad=whole_dur=4",
+            dur=4.0,
+        )
+        out = self.tmp / "out_trail"
+        subprocess.run(["videodna", "analyze", str(vid), "-o", str(out)],
+                       check=True, capture_output=True)
+        bp = json.loads((out / "blueprint.json").read_text(encoding="utf-8"))
+        self.assertGreaterEqual(bp["audio"]["dead_air_total_sec"], 1.5)
+        last = bp["audio"]["dead_air_segments"][-1]
+        self.assertAlmostEqual(last["end"], 4.0, delta=0.15)
+
+    def test_remake_plan_has_no_phantom_tools(self) -> None:
+        # v1.1.0 removed voice-pro / Kaggle GPU Upscaler; v2.0 brought
+        # them back in remake.py. Real routings only.
+        from videodna.remake import build_remake_plan
+        forensics = {"per_shot": [{"shot_id": 1, "start": 0.0, "end": 5.0,
+                                    "duration": 5.0, "predicted_type": "code_motion"}]}
+        color = {"lut_file": "reference_grade.cube", "grade_style": "test_grade"}
+        for audio_type in ("silent_no_audio", "test_tone", "music_only",
+                           "speech_only", "speech_plus_bgm"):
+            plan = build_remake_plan(
+                forensics,
+                {"audio_type": audio_type, "estimated_bpm": 120},
+                color,
+            )
+            blob = json.dumps(plan)
+            self.assertNotIn("voice-pro", blob)
+            self.assertNotIn("Kaggle GPU Upscaler", blob)
+            self.assertNotIn("voice_pro", blob)
+        self.assertIn("Cartesia", json.dumps(build_remake_plan(
+            forensics, {"audio_type": "silent_no_audio"}, color)))
+
+    def test_review_template_has_real_tool_routing(self) -> None:
+        # v2.0 deleted the remake_tool_routing block from the review
+        # template; v2.0.1 restores it with real tools.
+        from videodna.report import _build_review_template
+        tpl = _build_review_template({
+            "forensics": {"verdict_summary": "code_motion 100%",
+                          "per_shot": [{"shot_id": 1, "predicted_type": "code_motion",
+                                        "confidence": 0.8}]},
+        })
+        routing = tpl["beat_the_original"]["remake_tool_routing"]
+        self.assertIn("Cartesia", routing["voice_and_mix"])
+        self.assertIn("Kaggle", routing["upscale_and_grade"])
+        self.assertNotIn("voice-pro", json.dumps(routing))
 
 
 if __name__ == "__main__":

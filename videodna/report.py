@@ -1,4 +1,4 @@
-"""Layered AI-Native DNA.md, blueprint.json, sub-docs (shots, remake_plan, SRT, comments), and report.html (v2.0)."""
+"""Layered AI-Native DNA.md, blueprint.json, sub-docs (shots, remake_plan, SRT, comments), and report.html (v2.0.1)."""
 
 from __future__ import annotations
 
@@ -85,6 +85,12 @@ def _build_review_template(bp: dict[str, Any]) -> dict[str, Any]:
             ],
             "pacing_and_visual_upgrades": ["Fill exact timestamp fixes and visual upgrades"],
             "audio_and_sfx_upgrades": ["Fill exact LUFS/ducking/SFX upgrades"],
+            "remake_tool_routing": {
+                "cinematic_ai_shots": "Google Flow / Veo / Kling",
+                "motion_graphics_and_captions": "HyperFrames / Remotion",
+                "voice_and_mix": "Cartesia (or your TTS of choice) — master to -14 LUFS, tight compression, BGM ducking under the voice",
+                "upscale_and_grade": "Optional GPU upscale on Kaggle (only when the user asks) + reference_grade.cube LUT",
+            },
         },
         "shot_annotations": [
             {
@@ -129,12 +135,13 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
 
     audio_score_disp = "N/A (silent)" if d["scores"]["audio_dynamics"] is None else f"`{d['scores']['audio_dynamics']}`"
     lines = [
-        f"# VideoDNA v2.0 Report — `{p['filename']}`",
+        f"# VideoDNA v2.0.1 Report — `{p['filename']}`",
         "",
         "## 1. Executive Telemetry & Production Verdict",
         f"- **How It Was Made ({verdict_tag}):** **{verdict_str}** (Confidence: **{verdict_conf}%**)",
         f"- **Mode:** `{sh['mode'].upper()}` | **Duration:** `{p['duration_sec']}s` | **Resolution:** `{p['width']}x{p['height']}` (`{p['orientation']}`) | **FPS:** `{p['avg_fps']}` ({'VFR' if p['is_vfr'] else 'CFR'})",
         f"- **Retention Health Score (heuristic):** **{d['overall_retention_score']}/10** (Hook: `{d['scores']['hook_velocity']}` · Pacing: `{d['scores']['pacing_health']}` · Audio: {audio_score_disp})",
+        f"- *{d.get('score_note', '')}*" if d.get("score_note") else "",
         f"- **Shots & Transitions:** `{sh['shot_count']} shots` (`{sh.get('hard_cuts', 0)} hard cuts` + `{sh.get('soft_transitions', 0)} soft wipes/reveals`) · Avg Shot: `{sh['avg_shot_length_sec']}s` · `{sh['cuts_per_minute']} transitions/min` (`{sh['pacing_style']}`)",
         f"- **Hook Velocity:** `{sh['hook_cuts_0_3s']}` transitions in 0–3s · `{sh['hook_cuts_0_10s']}` in 0–10s",
         f"- **Audio Forensics:** {audio_line}",
@@ -426,7 +433,7 @@ def _render_html_report(bp: dict[str, Any]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VideoDNA v2.0 — {title}</title>
+<title>VideoDNA v2.0.1 — {title}</title>
 <style>
   :root {{ --bg:#0b0f19; --card:#131a2a; --border:#23304d; --text:#e6edf8; --muted:#8fa3c7; --accent:#58a6ff; }}
   * {{ box-sizing:border-box; }}
@@ -460,7 +467,7 @@ def _render_html_report(bp: dict[str, Any]) -> str:
 <div class="wrap">
   <header>
     <div>
-      <span class="badge">VideoDNA v2.0 · {sh['mode'].upper()} MODE</span>
+      <span class="badge">VideoDNA v2.0.1 · {sh['mode'].upper()} MODE</span>
       <h1>{title}</h1>
     </div>
     <div>

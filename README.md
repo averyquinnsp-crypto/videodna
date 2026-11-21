@@ -48,6 +48,17 @@ bash install.sh
 
 ---
 
+## What's New in v2.0.1
+
+Patch release on top of v2.0.0's mathematical forensics, smart audio, Bayesian review fusion, remake batch planner, `moments` zoomer, and SRT export. Fixes every issue found in the v2.0.0 review:
+
+- **Audio classifier tuned** — a pure 440Hz sine tone was misclassified as `speech_plus_bgm` with BPM 120. Now: a tonality check (dominant-bin ratio + spectral flatness) classifies near-pure tones as `test_tone` first; the BPM estimator requires at least 4 real onsets (≥10% of mean frame energy) before reporting a tempo; and BPM is only reported for music tracks, never for speech/ambient/test tones.
+- **Forensics tie-break fixed** — when no forensic rule fires, all 6 classes tie at 1/6 and the old code silently picked `live` (first in dict order), producing a bogus "live 41%" on videos with no live footage. A tie or near-tie is now `unknown`, flagged for visual review, with a dedicated `review_first` remake batch.
+- **Phantom tool names removed (again)** — `remake.py` reintroduced `voice-pro` and `Kaggle GPU Upscaler` in v2.0.0; routing is back to real tools (Cartesia voice, optional Kaggle upscale only when the user asks), and the review template's `remake_tool_routing` block is restored.
+- **Trailing silence restored** — the v1.1.0 fix for `silencedetect` trailing silence (start without a matching end) was dropped in v2.0.0; it counts to EOF again.
+- **install.sh now works on Ubuntu** — detects Debian/Ubuntu, installs missing system packages (`python3-venv`, `python3-pip`, `ffmpeg`), creates a venv at `<repo>/.venv` (fixes PEP 668 externally-managed pip on Ubuntu 24.04+), installs with dependencies + `yt-dlp`, and drops a `~/.local/bin/videodna` shim. Termux path unchanged; macOS/other falls back to a venv when system pip refuses.
+- **Tests** — 26-test stdlib suite: strict `test_find_yt_dlp` restored, plus v2.0.1 regression tests (440Hz tone, forensics tie, trailing silence, phantom-tool scan, template routing).
+
 ## What's New in v1.1.0
 
 - **Two-pass shot detection** — `scdet` (hard cuts) + a frame-diff pass (wipes / fades / slides / dissolves) merged, so code-rendered motion graphics no longer read as one long shot. Verified against rea-video's ground truth on the same video.
@@ -61,7 +72,7 @@ bash install.sh
 - **Tests** — 19-test stdlib suite (`python -m unittest discover -s tests -v`), including shot-detection regression tests.
 - Full Apache-2.0 license text.
 
-> **Honest limits:** the retention score is a rule-of-thumb heuristic, not measured audience retention — the telemetry (cuts, ASL, LUFS, dead-air, motion) is the truth. Forensic "AI detection" reads container metadata tags only; re-encoded videos usually have them stripped. The `.cube` LUT is a tonal approximation, not a true color transfer.
+> **Honest limits:** the retention score is a rule-of-thumb heuristic, not measured audience retention — the telemetry (cuts, ASL, LUFS, dead-air, motion) is the truth. Shot forensics measures real pixel/motion signals (noise, flatness, entropy, FFT coherence) but maps them with hand-tuned thresholds, not a trained classifier — a verdict with no fired rule is `unknown`, and low-confidence shots need visual review. The `.cube` LUT is a tonal approximation, not a true color transfer.
 
 ---
 
