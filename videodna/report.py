@@ -1,4 +1,4 @@
-"""Layered AI-Native DNA.md, blueprint.json, sub-docs (shots, remake_plan, SRT, comments), and report.html (v2.0.2)."""
+"""Layered AI-Native DNA.md, blueprint.json, sub-docs (shots, remake_plan, SRT, comments), and report.html (v2.0.3)."""
 
 from __future__ import annotations
 
@@ -211,7 +211,7 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
 
     audio_score_disp = "N/A (silent)" if d["scores"]["audio_dynamics"] is None else f"`{d['scores']['audio_dynamics']}`"
     lines = [
-        f"# VideoDNA v2.0.2 Report — `{p['filename']}`",
+        f"# VideoDNA v2.0.3 Report — `{p['filename']}`",
         "",
         "## 1. Executive Telemetry & Production Verdict",
         f"- **How It Was Made ({verdict_tag}):** **{verdict_str}** (Confidence: **{verdict_conf}%**)",
@@ -534,7 +534,7 @@ def _render_html_report(bp: dict[str, Any]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VideoDNA v2.0.2 — {title}</title>
+<title>VideoDNA v2.0.3 — {title}</title>
 <style>
   :root {{ --bg:#0b0f19; --card:#131a2a; --border:#23304d; --text:#e6edf8; --muted:#8fa3c7; --accent:#58a6ff; }}
   * {{ box-sizing:border-box; }}
@@ -568,7 +568,7 @@ def _render_html_report(bp: dict[str, Any]) -> str:
 <div class="wrap">
   <header>
     <div>
-      <span class="badge">VideoDNA v2.0.2 · {sh['mode'].upper()} MODE</span>
+      <span class="badge">VideoDNA v2.0.3 · {sh['mode'].upper()} MODE</span>
       <h1>{title}</h1>
     </div>
     <div>

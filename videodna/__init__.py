@@ -1,3 +1,3 @@
 """VideoDNA — 10x Video Reverse-Engineering & Beat-The-Original Engine."""
 
-__version__ = "2.0.2"
+__version__ = "2.0.3"

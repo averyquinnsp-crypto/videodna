@@ -1,5 +1,51 @@
 # VideoDNA Changelog
 
+## v2.0.3 — 2026-11-21
+
+Audio classifier fix: real continuous speech no longer classified as `ambient_or_sfx`. Scope is the audio classifier only — no changes to shot detection, verdict logic, install.sh, doctor, or OCR.
+
+### Bug
+
+v2.0.2 classified a real 51.85s Hindi reaction/edit video (loud, −7.3 LUFS, full of continuous dialogue) as **ambient_or_sfx, BPM None**, even though the video is full of Hindi speech. (rea-video, run on the same file, correctly called it "voice + music".) This was the "Speech gate validation" known-work item from v2.0.2: the pause gate had only ever been validated in the negative direction (continuous music no longer called speech) because no real speech sample existed on the VM at the time.
+
+### Root cause
+
+In `_classify_audio_content` (`videodna/audio.py`), branch 1 (`speech_only`) required `speech_e >= 0.58` **and** a pause structure of `low_energy_frac >= 0.14` (or `dead_air_ratio >= 0.05`). The real speech sample — loud continuous fast speech with almost no gaps — measured:
+
+- `speech_e` 0.5828 (only +0.0028 above the 0.58 gate — within re-encode noise)
+- `low_energy_frac` 0.0950 (below the 0.14 pause gate)
+- `dead_air` 0.0000, `bpm_conf` 0.11 (so branch 3's `bpm_conf >= 0.15` gate never fired either)
+
+It failed branch 1 on the pause gate and fell through every later branch to `ambient_or_sfx`. Both gates were too strict for loud continuous speech with no gaps and no steady beat.
+
+### Fix (two thresholds, branch 1 only)
+
+| Threshold | Before | After |
+|---|---|---|
+| Pause gate (`low_energy_frac`) | `>= 0.14` | `>= 0.05` |
+| Speech-band gate (`speech_e`) | `>= 0.58` | `>= 0.55` |
+
+The `dead_air_ratio >= 0.05` alternative in branch 1 is unchanged. Nothing else in the classifier changed: branch 3's `bpm_conf >= 0.15` and its inner pause gate (0.05 / 0.02), branch 2, branch 4 (`music_only` bass `>= 0.25`), and the test_tone thresholds (dominant bin `>= 0.45`, flatness `< 0.005`) are exactly as they were. No new feature was added as a speech signal — spectral flatness was considered and rejected: beat120 (flatness 0.5998) breaks it globally.
+
+### Why these values (measured margins)
+
+- **speech1** (real Hindi dialogue, must become speech): speech_e 0.5828, low_energy_frac 0.0950, dead_air 0.0000, bpm_conf 0.11. After the fix it passes branch 1: pause margin +0.045 above 0.05, speech_e margin +0.033 above 0.55.
+- **U4 music** (must stay non-speech): speech_e 0.5720, low_energy_frac 0.0053, dead_air 0.0000, bpm_conf 0.19. After the fix it still fails branch 1's pause gate (0.005 vs 0.05, margin 0.045 below) and branch 3's inner gate, so it stays **ambient_or_sfx** — unchanged from v2.0.2.
+- The pause gate (0.05) is now the sole separator between speech1 (+0.045 above) and U4 (0.045 below) in branch 1 — symmetric margins, and 0.05 is the exact midpoint of the two known samples.
+- **beat120** (flatness 0.5998, speech_e 0.5978) would pass the new speech_e test but is still blocked by the pause gate (0.000 vs 0.05). Clicks already exit via branch 1 (`dead_air` 0.95/0.87 or `low_energy` 0.76) and are unaffected.
+
+### Before / after
+
+| Sample | v2.0.2 | v2.0.3 |
+|---|---|---|
+| speech1 (real Hindi dialogue) | ambient_or_sfx, BPM None | **speech_only** |
+| U4 (music, no speech) | ambient_or_sfx, BPM None | ambient_or_sfx, BPM None (unchanged) |
+
+### Caveats (known, not fixed in this change)
+
+- **Clicks remain misclassified as `speech_only`** (pre-existing behaviour, unchanged by this fix).
+- **Threshold validated on two samples only** — one real-speech and one real-music sample exist. The 0.05 pause gate should be re-validated on more real samples before shipping: a music track with `low_energy_frac` slightly above 0.05 **and** `speech_e >= 0.55` would now be called `speech_only`.
+
 ## v2.0.2 — 2026-11-21
 
 Seven verified weaknesses from the 2026-11-21 head-to-head (7 videos, tools-only) fixed and regression-tested. Test suite: **61 passed, 2 skipped** (the 2 skips are the pre-existing regression-video skips — template/style-B videos absent). All fixes verified end-to-end on the 7 test videos with the repo venv binary.

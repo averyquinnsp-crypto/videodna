@@ -143,7 +143,19 @@ def _classify_audio_content(
     if dominant_bin_ratio >= 0.45 or spectral_flatness < 0.005:
         return "test_tone", feats
 
-    if speech_e >= 0.58 and bass_e < 0.22 and (low_energy_frac >= 0.14 or dead_air_ratio >= 0.05):
+    # v2.0.3: pause gate 0.14 -> 0.05, speech_e gate 0.58 -> 0.55.
+    # Measured on real samples: Hindi dialogue (speech1) has
+    # low_energy_frac 0.095 and speech_e 0.583 — it failed the old
+    # 0.14 pause gate and sat only +0.003 above the old speech_e gate,
+    # so loud continuous speech with almost no gaps (dead air 0.0,
+    # bpm_conf 0.11) fell through to ambient_or_sfx. Music (U4) has
+    # low_energy_frac 0.005 and speech_e 0.572, so it still fails the
+    # 0.05 pause gate by a symmetric 0.045 margin (0.05 is the exact
+    # midpoint of the two known samples); the pause gate, not
+    # speech_e, is the separator. Re-validate 0.05 on more real
+    # samples before shipping — only one real-speech and one
+    # real-music sample exist so far.
+    if speech_e >= 0.55 and bass_e < 0.22 and (low_energy_frac >= 0.05 or dead_air_ratio >= 0.05):
         return "speech_only", feats
     if (bass_e >= 0.22 or bpm_conf >= 0.25) and low_energy_frac < 0.12:
         if speech_e >= 0.45:
