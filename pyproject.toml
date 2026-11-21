@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "videodna"
-version = "2.0.3"
+version = "2.0.4"
 description = "10x Video Reverse-Engineering, Viral Retention X-Ray & Beat-The-Original Blueprint Engine for Short & Long Videos."
 readme = "README.md"
 requires-python = ">=3.10"

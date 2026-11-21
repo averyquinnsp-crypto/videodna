@@ -53,11 +53,14 @@ def _analyze(video: Path, out_dir: Path) -> dict:
 class TestHonestVerdict(unittest.TestCase):
     def test_low_confidence_uses_real_runner_up(self) -> None:
         from videodna.forensics import honest_verdict_summary
+        # v2.0.4: the low-confidence verdict is the FULL mean-softmax mix
+        # plus the uncertainty qualifier (v2.0.2's short "top / runner_up"
+        # form could not name the live share AND the AI/3D share of a
+        # mixed video). Runner-up is still the real second-highest class.
         verdict, uncertain, runner_up = honest_verdict_summary(U4_BREAKDOWN, U4_PROBS, 0.43)
-        self.assertEqual(verdict, "code_motion / static_zoom — uncertain from pixels alone")
+        self.assertEqual(verdict, "code_motion 100% — uncertain from pixels alone")
         self.assertTrue(uncertain)
         self.assertEqual(runner_up, "static_zoom")
-        self.assertNotIn("100%", verdict)
 
     def test_high_confidence_verdicts_unchanged(self) -> None:
         from videodna.forensics import honest_verdict_summary
@@ -100,9 +103,11 @@ class TestHonestVerdict(unittest.TestCase):
             }],
         }
         fused = fuse_review_probabilities(forensics, {"shot_annotations": []})
+        # v2.0.4: fused path shows the same mean-softmax mix + qualifier.
         self.assertEqual(
             fused["verdict_summary"],
-            "code_motion / static_zoom — uncertain from pixels alone",
+            "code_motion 47% + static_zoom 24% + screen_rec 14% + 3d_render 8% "
+            "+ live 4% + ai_video 4% — uncertain from pixels alone",
         )
         self.assertTrue(fused["verdict_uncertain"])
         self.assertEqual(fused["runner_up"], "static_zoom")
@@ -231,9 +236,12 @@ class TestEndToEndV202(unittest.TestCase):
             self.skipTest(f"U4 video missing: {U4}")
         out = self.tmp / "u4"
         bp = _analyze(U4, out)
+        # v2.0.4: full mean-softmax mix + uncertainty qualifier (v2.0.2's
+        # short "code_motion / static_zoom" form is replaced — see CHANGELOG).
         self.assertEqual(
             bp["forensics"]["verdict_summary"],
-            "code_motion / static_zoom — uncertain from pixels alone",
+            "code_motion 47% + static_zoom 24% + screen_rec 14% + 3d_render 8% "
+            "+ live 4% + ai_video 4% — uncertain from pixels alone",
         )
         self.assertLess(bp["forensics"]["overall_confidence"], 0.5)
         self.assertTrue(bp["forensics"]["verdict_uncertain"])
@@ -242,10 +250,13 @@ class TestEndToEndV202(unittest.TestCase):
         # Diagnostics passthrough carries the same honest wording.
         self.assertEqual(
             bp["diagnostics"]["production_verdict_auto"],
-            "code_motion / static_zoom — uncertain from pixels alone",
+            "code_motion 47% + static_zoom 24% + screen_rec 14% + 3d_render 8% "
+            "+ live 4% + ai_video 4% — uncertain from pixels alone",
         )
         dna = (out / "DNA.md").read_text(encoding="utf-8")
-        self.assertIn("code_motion / static_zoom — uncertain from pixels alone", dna)
+        self.assertIn(
+            "code_motion 47% + static_zoom 24% + screen_rec 14% + 3d_render 8% "
+            "+ live 4% + ai_video 4% — uncertain from pixels alone", dna)
         self.assertNotIn("code_motion 100%", dna)
 
     def test_u2_shot_cards_measured_and_no_invented_text(self) -> None:
@@ -253,20 +264,34 @@ class TestEndToEndV202(unittest.TestCase):
             self.skipTest(f"U2 video missing: {U2}")
         out = self.tmp / "u2"
         bp = _analyze(U2, out)
-        # U2 verdict must stay assertive (conf 0.78).
-        self.assertEqual(bp["forensics"]["verdict_summary"], "code_motion 100%")
+        # U2 verdict must stay assertive (conf 0.78) — v2.0.4 shows the
+        # mean-softmax mix instead of the old winner-take-all "100%".
+        self.assertEqual(
+            bp["forensics"]["verdict_summary"],
+            "code_motion 79% + 3d_render 7% + static_zoom 4% + screen_rec 4% "
+            "+ live 3% + ai_video 3%",
+        )
         self.assertEqual(bp["shots"]["shot_count"], 4)
         self.assertEqual(len(bp["remake_plan"]["shot_cards"]), 4)
         for card in bp["remake_plan"]["shot_cards"]:
             self.assertEqual(len(card["palette_hex"]), 3)
             self.assertTrue(all(h.startswith("#") and len(h) == 7 for h in card["palette_hex"]))
             self.assertIsNotNone(card["motion_mean_frame_diff"])
-            self.assertEqual(card["on_screen_text"], "text not extracted (no OCR available)")
+        # v2.0.4 item 6: tesseract OCR now runs (was "text not extracted
+        # (no OCR available)" on every card). Shot 3's overlay text
+        # reads "Text 4 Text 4"; shots 1/2/4 have no word passing the
+        # quality gate, so they honestly report "no text detected".
+        cards = {c["shot_id"]: c for c in bp["remake_plan"]["shot_cards"]}
+        self.assertEqual(cards[3]["on_screen_text"], "Text 4 Text 4")
+        for sid in (1, 2, 4):
+            self.assertEqual(cards[sid]["on_screen_text"], "no text detected")
         for fname in ("dna/remake_plan.md", "dna/shots.md"):
             text = (out / fname).read_text(encoding="utf-8")
-            self.assertIn("text not extracted (no OCR available)", text)
-            # U2 shows a big BLOOD title on screen; with no OCR installed
-            # the report must NOT claim that (or any) on-screen text.
+            self.assertIn("no text detected", text)
+            self.assertIn("Text 4 Text 4", text)
+            # U2 shows a big BLOOD title on screen; tesseract never
+            # reads it (stylised display font — see CHANGELOG v2.0.4),
+            # so the report must NOT claim that (or any) on-screen text.
             self.assertNotIn("BLOOD", text)
         # DNA.md carries only a pointer to the cards, not the cards themselves.
         dna_text = (out / "DNA.md").read_text(encoding="utf-8")
@@ -278,20 +303,30 @@ class TestEndToEndV202(unittest.TestCase):
         self.assertIn("`opening`", remake_md)
         self.assertIn("`hard_cut`", remake_md)
 
-    def test_high_confidence_verdicts_unchanged_end_to_end(self) -> None:
-        # U1 0.73, test.mp4 0.72, M3 0.71, multi.mp4 0.59 (baseline values):
-        # the verdict string must stay exactly "code_motion 100%".
-        # (U1's shot count/confidence may shift while a parallel fix to
-        # shot segmentation lands — only the verdict string is asserted.)
+    def test_high_confidence_verdicts_show_mean_softmax_mix_end_to_end(self) -> None:
+        # U1 0.88, test.mp4 0.72, M3 0.71, multi.mp4 0.59 (baseline confidences):
+        # v2.0.4 shows the duration-weighted mean-softmax mix instead of the
+        # old winner-take-all "code_motion 100%". Confidences and the
+        # assertive (non-uncertain) wording are unchanged.
         missing = [n for n, p in (("u1", U1), ("test", TEST_MP4), ("m3", M3_MP4),
                                    ("multi", MULTI_MP4)) if not p.exists()]
         if missing:
             self.skipTest(f"videos missing: {missing}")
+        expected = {
+            "u1": "code_motion 90% + screen_rec 5% + live 1% + ai_video 1% "
+                  "+ 3d_render 1% + static_zoom 1%",
+            "test": "code_motion 71% + static_zoom 14% + screen_rec 8% "
+                    "+ live 2% + ai_video 2% + 3d_render 2%",
+            "m3": "code_motion 70% + static_zoom 11% + screen_rec 11% "
+                  "+ live 3% + ai_video 3% + 3d_render 3%",
+            "multi": "code_motion 62% + static_zoom 24% + live 4% + ai_video 4% "
+                     "+ 3d_render 4% + screen_rec 4%",
+        }
         for name, path in (("u1", U1), ("test", TEST_MP4), ("m3", M3_MP4),
                            ("multi", MULTI_MP4)):
             bp = _analyze(path, self.tmp / name)
             self.assertEqual(
-                bp["forensics"]["verdict_summary"], "code_motion 100%",
+                bp["forensics"]["verdict_summary"], expected[name],
                 f"{name} verdict changed: {bp['forensics']['verdict_summary']!r}",
             )
             self.assertGreaterEqual(bp["forensics"]["overall_confidence"], 0.5, name)

@@ -10,13 +10,18 @@ The two cut lists are merged (scdet wins ties inside min_gap).
 
 from __future__ import annotations
 
+import math
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
+
+from videodna.forensics import _phase_shift
 
 SCDET_RE = re.compile(r"lavfi\.scd\.score:\s*([0-9.]+),\s*lavfi\.scd\.time:\s*([0-9.]+)")
 
@@ -99,6 +104,310 @@ def _sample_frames_at(
             pass
         proc.wait()
     return found
+
+
+# ---------------------------------------------------------------------------
+# v2.0.4 item 3: soft-transition subtyping (fade / dissolve / slide_wipe /
+# soft_unknown). Runs ONLY on frame-diff survivors, AFTER the v2.0.2 guard
+# has kept them — it never feeds back into cut decisions, never changes
+# transition_in, and never changes a shot boundary. A subtype is a label
+# on an existing cut, nothing more.
+#
+# Method (tuned on M3 / multi.mp4 / a true fade-through-black fixture /
+# a wipeleft fixture — see CHANGELOG v2.0.4 for the measured numbers):
+# re-decode a [t-1s, t+1s] window at 12fps / 160px with a seek (a 6fps
+# decode gives only ~3 samples across a 0.5s dissolve — too coarse).
+# A = settled frame before, B = settled frame after. Tests run in order:
+#   1. FADE: mean luma dips below 0.35x min(L(A), L(B)) — or absolutely
+#      below 20 (to black) / above 235 (to white) — with recovery on
+#      both sides (the dip is interior, not a step to a darker scene).
+#      A dissolve/slide can never trip this: a blend's luma stays
+#      between L(A) and L(B), and a slide's does too.
+#   2. DISSOLVE: for each mid frame M, fit scalar alpha minimising
+#      ||M - (alpha*A + (1-alpha)*B)||. Label dissolve if the fit
+#      residual is < 0.5x ||M - A|| with alpha in (0.2, 0.8) for >= 3
+#      consecutive samples (a plateau, not a single spike). A hard cut
+#      fails this (alpha ~0 or ~1); a slide fails on residual (a
+#      spatial mix is not a global blend).
+#   3. SLIDE / PUSH / WIPE (labelled jointly "slide_wipe"): the
+#      outgoing frame TRANSLATES during a slide, so a strip test
+#      against the static A frame is meaningless (measured on M3: the
+#      whole frame reads "changed" within 0.1s of the slide start).
+#      Instead, phase-correlate consecutive window frames: a slide is
+#      a fast coherent pure-axial translation — >= 3 consecutive pairs
+#      with the same-sign shift >= 4px/frame at 160px on one axis,
+#      <= 1px on the other, corrected coherence >= 0.5 — AND the run
+#      must displace >= half the frame width in total (M3 slide: 160px
+#      in 7 pairs; a slow U2 overlay drift manages only ~50px in 7
+#      pairs and must not read as a slide).
+#   4. REVEAL-WIPE (same "slide_wipe" label): xfade wipeleft is NOT a
+#      translating slide — the old frame stays put and the new one is
+#      revealed by a moving edge. A mid frame is "wipe-clean" only when
+#      its strips split into a matched group (mean diff vs B < 8 — the
+#      revealed region IS B) and an unmatched group (diff > 40),
+#      allowing one intermediate boundary strip, with the matched group
+#      a prefix or suffix; the wipe-clean matched-counts must grow
+#      monotonically through >= 4 distinct values, starting <= 2 and
+#      ending >= 5. The sharpness is what separates a reveal from a
+#      slow drift/pan into the new layout: a drift's strip diffs form
+#      a smooth gradient (no strip is ever < 8 while its neighbour is
+#      > 40). Measured: wipeleft gives wipe-clean counts 1,3,4,5,6
+#      (revealed strips exactly 0.0, unrevealed 90-148); a U2 overlay
+#      drift gives only 3 distinct wipe-clean counts (2,3,4).
+# Gate: the settled frames at t+-0.75s must differ across >= 45% of
+# pixels (the guard's own line, recomputed from the window frames) —
+# on a flat/textureless pair the blend fit passes vacuously and the
+# strip test is meaningless, so anything below the gate stays
+# "soft_unknown". Any disagreement between tests also defaults to
+# "soft_unknown". Never force a subtype.
+# ---------------------------------------------------------------------------
+
+TRANSITION_SAMPLE_FPS = 12.0
+TRANSITION_WINDOW_SEC = 1.0
+TRANSITION_MIN_CHANGED_FRACTION = GUARD_MIN_CHANGED_FRACTION  # 0.45
+TRANSITION_FADE_RELATIVE = 0.35
+TRANSITION_FADE_BLACK_LUMA = 20.0
+TRANSITION_FADE_WHITE_LUMA = 235.0
+TRANSITION_DISSOLVE_MIN_CONSECUTIVE = 3
+TRANSITION_DISSOLVE_MAX_RESIDUAL_RATIO = 0.5
+TRANSITION_SLIDE_MIN_CONSECUTIVE = 3
+TRANSITION_SLIDE_MIN_SHIFT_PX = 4
+TRANSITION_SLIDE_MAX_ORTHO_PX = 1
+TRANSITION_SLIDE_MIN_COHERENCE = 0.5
+TRANSITION_SLIDE_MIN_DISPLACEMENT_FRAC = 0.5  # run must move >= half the frame width
+TRANSITION_WIPE_STRIP_MATCH_DIFF = 8.0  # a revealed strip IS the settled frame
+TRANSITION_WIPE_STRIP_NOMATCH_DIFF = 40.0  # an unrevealed strip is clearly different
+TRANSITION_WIPE_MIN_INTERMEDIATE_VALUES = 4
+
+
+def _sample_window_frames(
+    video_path: Path,
+    start: float,
+    end: float,
+    sample_fps: float,
+    sample_w: int,
+    sample_h: int,
+) -> dict[int, np.ndarray]:
+    """Seek-decode the frames of one [start, end] window at sample_fps.
+
+    Unlike _sample_frames_at (which streams from 0 — the guard needs
+    that), this seeks straight to the window: a classifier that runs
+    once per soft cut must not pay a full-file decode per cut. Returns
+    {frame_index: flat uint8 RGB array} with index 0 == start (the fps
+    filter re-timestamps from the seek point). Returns {} on failure
+    (callers then keep the cut as soft_unknown — fail open).
+    """
+    if end <= start:
+        return {}
+    n_want = max(1, int(round((end - start) * sample_fps)) + 1)
+    frame_bytes = sample_w * sample_h * 3
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{max(0.0, start):.3f}",
+        "-i", str(video_path),
+        "-t", f"{end - start:.3f}",
+        "-vf", f"fps={sample_fps},scale={sample_w}:{sample_h}",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return {}
+    assert proc.stdout is not None
+    found: dict[int, np.ndarray] = {}
+    try:
+        idx = 0
+        while idx < n_want:
+            buf = proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
+                break
+            found[idx] = np.frombuffer(buf, dtype=np.uint8).copy()
+            idx += 1
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        proc.wait()
+    return found
+
+
+def _classify_soft_transition(
+    video_path: Path,
+    t: float,
+    duration: float,
+    sample_w: int,
+    sample_h: int,
+) -> str:
+    """Subtype one surviving soft transition at time t (see header above).
+
+    Returns "fade" | "dissolve" | "slide_wipe" | "soft_unknown".
+    """
+    win_start = max(0.0, t - TRANSITION_WINDOW_SEC)
+    win_end = min(duration, t + TRANSITION_WINDOW_SEC)
+    raw = _sample_window_frames(
+        video_path, win_start, win_end,
+        TRANSITION_SAMPLE_FPS, sample_w, sample_h,
+    )
+    if len(raw) < 5:
+        return "soft_unknown"
+    idxs = sorted(raw)
+    frames = {i: raw[i].reshape(sample_h, sample_w, 3) for i in idxs}
+    times = {i: win_start + i / TRANSITION_SAMPLE_FPS for i in idxs}
+    A = frames[idxs[0]].astype(np.float32)
+    B = frames[idxs[-1]].astype(np.float32)
+
+    # Gate: settled frames either side must differ across >= 45% of
+    # pixels, else the subtype tests are meaningless (flat pairs).
+    ib = min(idxs, key=lambda i: abs(times[i] - (t - GUARD_OFFSET_SEC)))
+    ia = min(idxs, key=lambda i: abs(times[i] - (t + GUARD_OFFSET_SEC)))
+    if _changed_fraction(raw[ib], raw[ia]) < TRANSITION_MIN_CHANGED_FRACTION:
+        return "soft_unknown"
+
+    lumas = {
+        i: (
+            0.299 * frames[i][..., 0].astype(np.float32)
+            + 0.587 * frames[i][..., 1].astype(np.float32)
+            + 0.114 * frames[i][..., 2].astype(np.float32)
+        )
+        for i in idxs
+    }
+    L = {i: float(lumas[i].mean()) for i in idxs}
+    l_a, l_b = L[idxs[0]], L[idxs[-1]]
+    l_min, l_max = min(L.values()), max(L.values())
+
+    # (1) FADE — interior luma dip (through black or white).
+    if (
+        l_min < TRANSITION_FADE_BLACK_LUMA
+        and l_a > l_min + 15.0
+        and l_b > l_min + 15.0
+    ):
+        return "fade"
+    if (
+        l_max > TRANSITION_FADE_WHITE_LUMA
+        and l_a < l_max - 15.0
+        and l_b < l_max - 15.0
+    ):
+        return "fade"
+    if (
+        l_min < TRANSITION_FADE_RELATIVE * min(l_a, l_b)
+        and l_a > l_min + 10.0
+        and l_b > l_min + 10.0
+    ):
+        return "fade"
+
+    mids = idxs[1:-1]
+    d_ab = float(np.mean(np.abs(A - B)))
+
+    # (2) DISSOLVE — global blend fit holds for a run of mid frames.
+    if d_ab >= 10.0:
+        run = 0
+        best_run = 0
+        for i in mids:
+            M = frames[i].astype(np.float32)
+            d_ma = float(np.mean(np.abs(M - A)))
+            good = False
+            if d_ma >= 12.0:
+                num = float(np.sum((M - B) * (A - B)))
+                den = float(np.sum((A - B) ** 2))
+                alpha = num / den if den > 0 else 0.0
+                resid = float(np.mean(np.abs(M - (alpha * A + (1.0 - alpha) * B))))
+                good = (
+                    0.2 < alpha < 0.8
+                    and resid < TRANSITION_DISSOLVE_MAX_RESIDUAL_RATIO * d_ma
+                )
+            run = run + 1 if good else 0
+            best_run = max(best_run, run)
+        if best_run >= TRANSITION_DISSOLVE_MIN_CONSECUTIVE:
+            return "dissolve"
+
+    # (3) SLIDE / PUSH — fast coherent pure-axial translation between
+    # consecutive window frames (the outgoing frame translates, so
+    # strip-vs-A tests are meaningless here — see header). A slide by
+    # definition moves content across a large part of the frame, so
+    # the run must also displace >= half the frame width in total —
+    # this is what separates a slide from a slow drift/pan that merely
+    # spans the cut (measured: M3 slide displaces 160px = the full
+    # 160px width in 7 pairs; a U2 overlay drift displaces only ~50px
+    # in 7 pairs and must NOT read as a slide).
+    best_disp = 0.0
+    run = 0
+    run_disp = 0.0
+    run_sign: tuple[str, int] | None = None
+    for k in range(len(idxs) - 1):
+        dx, dy, coh, raw_diff = _phase_shift(lumas[idxs[k]], lumas[idxs[k + 1]])
+        usable: tuple[str, int] | None = None
+        shift = 0
+        if raw_diff >= 0.8 and coh >= TRANSITION_SLIDE_MIN_COHERENCE:
+            if abs(dx) >= TRANSITION_SLIDE_MIN_SHIFT_PX and abs(dy) <= TRANSITION_SLIDE_MAX_ORTHO_PX:
+                usable = ("x", 1 if dx > 0 else -1)
+                shift = abs(dx)
+            elif abs(dy) >= TRANSITION_SLIDE_MIN_SHIFT_PX and abs(dx) <= TRANSITION_SLIDE_MAX_ORTHO_PX:
+                usable = ("y", 1 if dy > 0 else -1)
+                shift = abs(dy)
+        if usable is not None and usable == run_sign:
+            run += 1
+            run_disp += shift
+        elif usable is not None:
+            run, run_disp, run_sign = 1, float(shift), usable
+        else:
+            run, run_disp, run_sign = 0, 0.0, None
+        if run >= TRANSITION_SLIDE_MIN_CONSECUTIVE:
+            best_disp = max(best_disp, run_disp)
+    if best_disp >= TRANSITION_SLIDE_MIN_DISPLACEMENT_FRAC * sample_w:
+        return "slide_wipe"
+
+    # (4) REVEAL-WIPE — strips progressively match the settled B frame
+    # (the old frame stays put; the new one is revealed by a moving
+    # edge). A frame is "wipe-clean" only when its strips split into
+    # a matched group (diff < 8 — the revealed region IS B, near-exact)
+    # and an unmatched group (diff > 40), allowing ONE intermediate
+    # strip adjacent to the matched group (the boundary strip itself),
+    # with the matched group a prefix or suffix (contiguous from one
+    # edge). Collect wipe-clean matched-counts in time order and
+    # require >= 4 distinct values, non-decreasing, starting <= 2 and
+    # ending >= 5. The sharpness is what separates a reveal from a
+    # slow drift/pan into the new layout: a drift's strip diffs form a
+    # smooth gradient (no strip is ever < 8 while its neighbour is
+    # > 40), so it never produces a wipe-clean frame.
+    for axis in (0, 1):
+        clean_counts: list[int] = []
+        for i in mids:
+            d = np.mean(np.abs(frames[i].astype(np.float32) - B), axis=2)
+            n = 8
+            if axis == 0:
+                fr = [float(d[:, j * sample_w // n:(j + 1) * sample_w // n].mean()) for j in range(n)]
+            else:
+                fr = [float(d[j * sample_h // n:(j + 1) * sample_h // n, :].mean()) for j in range(n)]
+            matched = [j for j, x in enumerate(fr) if x < TRANSITION_WIPE_STRIP_MATCH_DIFF]
+            if not (0 < len(matched) < n):
+                continue
+            if matched != list(range(len(matched))) and matched != list(range(n - len(matched), n)):
+                continue
+            # One intermediate strip allowed, adjacent to the matched group.
+            edge = matched[-1] + 1 if matched == list(range(len(matched))) else matched[0] - 1
+            ok = True
+            for j, x in enumerate(fr):
+                if j in matched:
+                    continue
+                if j == edge:
+                    continue
+                if x <= TRANSITION_WIPE_STRIP_NOMATCH_DIFF:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            clean_counts.append(len(matched))
+        if len(clean_counts) < 2:
+            continue
+        if clean_counts[0] > 2 or clean_counts[-1] < 5:
+            continue
+        if not all(clean_counts[k + 1] >= clean_counts[k] for k in range(len(clean_counts) - 1)):
+            continue
+        if len({c for c in clean_counts if 0 < c < 8}) >= TRANSITION_WIPE_MIN_INTERMEDIATE_VALUES:
+            return "slide_wipe"
+
+    return "soft_unknown"
 
 
 def _guard_soft_cuts(
@@ -246,6 +555,240 @@ def _frame_diff_cuts(
     return cuts, suppressed
 
 
+def _build_rhythm(
+    shots: list[dict[str, Any]],
+    duration: float,
+    total_cuts: int,
+) -> dict[str, Any]:
+    """Rhythm/pacing detail for the v2.0.4 rhythm section (pure function of the
+    full shot list — no sampling caps, no retention weights touched).
+
+    - Shot-length stats (min/median/max) plus WHICH shots are longest/shortest
+      (shot id + window), so the pacing is traceable to concrete shots.
+    - cuts_per_10s: overall cut density on a 10-second grid.
+    - pacing_curve: one entry per 10s window — shots starting in the window
+      and cuts landing in it (shot 1 at 0.0s is a start, not a cut).
+    - transitions: every cut as (time, into-shot, type). Transition duration
+      is NOT measured (only the cut instant is known), so no duration field.
+    """
+    if not shots:
+        return {
+            "shot_length_min_sec": 0.0,
+            "shot_length_median_sec": 0.0,
+            "shot_length_max_sec": 0.0,
+            "longest_shot": None,
+            "shortest_shot": None,
+            "cuts_per_10s": 0.0,
+            "pacing_curve": [],
+            "transitions": [],
+        }
+    durations = [float(s["duration"]) for s in shots]
+    longest = max(shots, key=lambda s: float(s["duration"]))
+    shortest = min(shots, key=lambda s: float(s["duration"]))
+
+    def _window(s: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "shot_id": s["id"],
+            "start": s["start"],
+            "end": s["end"],
+            "duration": s["duration"],
+        }
+
+    curve: list[dict[str, Any]] = []
+    if duration > 0:
+        n_windows = max(1, math.ceil(duration / 10.0))
+        for w in range(n_windows):
+            ws = round(w * 10.0, 2)
+            we = round(min((w + 1) * 10.0, duration), 2)
+            started = [s for s in shots if ws <= float(s["start"]) < we]
+            cuts = [s for s in started if float(s["start"]) > 0.0]
+            curve.append({
+                "window_start": ws,
+                "window_end": we,
+                "shots": len(started),
+                "cuts": len(cuts),
+            })
+
+    # "subtype" is added only for soft transitions that got one — a
+    # hard_cut entry stays exactly {"time", "into_shot", "type"} (the
+    # v2.0.4 rhythm tests assert that shape).
+    transitions: list[dict[str, Any]] = []
+    for s in shots[1:]:
+        entry: dict[str, Any] = {
+            "time": s["start"],
+            "into_shot": s["id"],
+            "type": s.get("transition_in", "-"),
+        }
+        if s.get("transition_subtype"):
+            entry["subtype"] = s["transition_subtype"]
+        transitions.append(entry)
+    return {
+        "shot_length_min_sec": round(min(durations), 2),
+        "shot_length_median_sec": round(float(np.median(durations)), 2),
+        "shot_length_max_sec": round(max(durations), 2),
+        "longest_shot": _window(longest),
+        "shortest_shot": _window(shortest),
+        "cuts_per_10s": round(total_cuts / (duration / 10.0), 2) if duration > 0 else 0.0,
+        "pacing_curve": curve,
+        "transitions": transitions,
+    }
+
+
+def export_shot_frames(
+    video_path: Path,
+    shots: list[dict[str, Any]],
+    out_dir: Path,
+    fps: float = 30.0,
+    width: int = 480,
+    orig_width: int | None = None,
+    orig_height: int | None = None,
+) -> dict[int, dict[str, str]]:
+    """Export first/mid/last frame JPEGs for EVERY shot into dna/frames/.
+
+    ONE ffmpeg streaming decode at export resolution (constant memory — each
+    wanted frame is written to disk the moment it arrives; nothing is held
+    except the <=6 small strip frames per shot, composed at the end). No
+    per-frame ffmpeg spawn: spawn/seek would dominate on long videos.
+
+    Frame times use a small inset so the "first" frame is inside the shot,
+    not the last frame of the previous one. Timestamps map to frame indices
+    via the probe fps (nearest frame; VFR sources are approximate). A strip
+    (<=6 evenly spaced frames tiled into one contact image) is built from the
+    same pass when the shot is >= 1s; shorter shots get no strip.
+
+    Returns {shot_id: {"first": rel, "mid": rel, "last": rel, "strip": rel}}
+    with paths relative to out_dir (e.g. "dna/frames/shot-01-first.jpg").
+    Returns {} on any ffmpeg failure (fail open — the pipeline continues
+    without frame paths, exactly like the v2.0.2 guard's fail-open rule).
+    """
+    if not shots:
+        return {}
+    fps = float(fps) if fps and float(fps) > 0 else 30.0
+    # Cap the decode at 30 fps: stills only need ~±16 ms accuracy, and a
+    # 60 fps source decodes ~30% faster with the fps filter dropping frames
+    # before the scaler (measured on speech2: 14.1s -> 10.1s for the pass).
+    # Index mapping below uses the effective fps.
+    eff_fps = min(fps, 30.0)
+    if orig_width and orig_height:
+        exp_h = max(2, int(round(orig_height * width / orig_width / 2.0) * 2))
+    else:
+        exp_h = 270
+    frames_dir = out_dir / "dna" / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    # wanted[idx] = list of (shot_id, label) — labels dedupe by frame index
+    # so a 0.1s shot whose first/mid/last land on one frame writes one file.
+    wanted: dict[int, list[tuple[int, str]]] = {}
+
+    def _want(shot_id: int, label: str, t: float) -> None:
+        wanted.setdefault(int(round(max(0.0, t) * eff_fps)), []).append((shot_id, label))
+
+    for s in shots:
+        sid = int(s["id"])
+        dur = float(s["duration"])
+        start = float(s["start"])
+        end = float(s["end"])
+        inset = min(0.05, dur * 0.1)
+        _want(sid, "first", start + inset)
+        _want(sid, "mid", start + dur / 2.0)
+        _want(sid, "last", end - inset)
+        n_strip = 6 if dur >= 2.0 else (4 if dur >= 1.0 else 0)
+        if n_strip >= 2 and dur - 2 * inset > 0:
+            span = dur - 2 * inset
+            for i in range(n_strip):
+                _want(sid, f"strip_{i}", start + inset + span * i / (n_strip - 1))
+
+    if not wanted:
+        return {}
+    last_idx = max(wanted)
+    frame_bytes = width * exp_h * 3
+    vf = f"scale={width}:{exp_h}"
+    if eff_fps < fps:
+        vf = f"fps={eff_fps},scale={width}:{exp_h}"
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", str(video_path),
+        "-vf", vf,
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return {}
+    assert proc.stdout is not None
+
+    result: dict[int, dict[str, str]] = {}
+    strip_parts: dict[int, list[Path]] = {}
+    try:
+        idx = 0
+        while idx <= last_idx:
+            buf = proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
+                break
+            labels = wanted.get(idx)
+            if labels is not None:
+                arr = np.frombuffer(buf, dtype=np.uint8).reshape(exp_h, width, 3)
+                img = Image.fromarray(arr)
+                for sid, label in labels:
+                    if label.startswith("strip_"):
+                        tmp = frames_dir / f".strip-{sid:02d}-{label[6:]}.jpg"
+                        img.save(tmp, format="JPEG", quality=88)
+                        strip_parts.setdefault(sid, []).append(tmp)
+                    else:
+                        name = f"shot-{sid:02d}-{label}.jpg"
+                        img.save(frames_dir / name, format="JPEG", quality=88)
+                        result.setdefault(sid, {})[label] = f"dna/frames/{name}"
+            idx += 1
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        proc.wait()
+
+    # Compose each strip from its saved frames, then delete the parts.
+    for sid, parts in strip_parts.items():
+        parts = sorted(parts)
+        try:
+            tiles = [Image.open(p).convert("RGB") for p in parts]
+            if len(tiles) < 2:
+                continue
+            tw, th = tiles[0].size
+            strip = Image.new("RGB", (tw * len(tiles), th), (0, 0, 0))
+            for i, tile in enumerate(tiles):
+                strip.paste(tile, (i * tw, 0))
+            name = f"shot-{sid:02d}-strip.jpg"
+            strip.save(frames_dir / name, format="JPEG", quality=88)
+            result.setdefault(sid, {})["strip"] = f"dna/frames/{name}"
+        finally:
+            for p in parts:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+    # Fallback: the container duration can run slightly past the last
+    # decodable frame (speech2: container 21.32s, last video frame at
+    # 21.27s), so a shot's "last" timestamp may map past the end of the
+    # stream. Copy the same shot's mid (else first) frame into any missing
+    # first/mid/last slot — same shot, a fraction of a second away — so
+    # the per-shot contract (all three frames exist) always holds.
+    for s in shots:
+        sid = int(s["id"])
+        have = result.get(sid, {})
+        donor = have.get("mid") or have.get("first") or have.get("last")
+        if not donor:
+            continue
+        for label in ("first", "mid", "last"):
+            if label not in have:
+                name = f"shot-{sid:02d}-{label}.jpg"
+                # donor is stored relative to out_dir ("dna/frames/..."),
+                # so take its basename inside frames_dir.
+                shutil.copyfile(frames_dir / Path(donor).name, frames_dir / name)
+                result.setdefault(sid, {})[label] = f"dna/frames/{name}"
+    return result
+
+
 def detect_shots(
     video_path: Path,
     duration: float,
@@ -331,7 +874,24 @@ def detect_shots(
                 "opening" if cut_src == "start"
                 else ("hard_cut" if cut_src == "scdet" else "soft_transition")
             ),
+            # v2.0.4 item 3: subtype is set below, for soft transitions
+            # only. None elsewhere (opening / hard_cut have no transition
+            # to subtype). Labelling only — never a cut decision.
+            "transition_subtype": None,
         })
+
+    # v2.0.4 item 3: subtype each surviving soft transition (runs AFTER
+    # the guard, on final shot boundaries only). Same 160px sampling
+    # geometry as the frame-diff pass.
+    if width and height:
+        sub_h = max(2, int(round(height * 160 / width / 2.0) * 2))
+    else:
+        sub_h = 90
+    for s in shots:
+        if s["transition_in"] == "soft_transition":
+            s["transition_subtype"] = _classify_soft_transition(
+                video_path, s["start"], duration, 160, sub_h,
+            )
 
     if not shots:
         shots = [{
@@ -342,6 +902,7 @@ def detect_shots(
             "cut_score_in": 0.0,
             "cut_source_in": "start",
             "transition_in": "opening",
+            "transition_subtype": None,
         }]
 
     durations = [s["duration"] for s in shots]
@@ -412,6 +973,7 @@ def detect_shots(
         "shortest_shot_sec": round(min(durations), 2),
         "longest_shot_sec": round(max(durations), 2),
         "cuts_per_minute": cuts_per_min,
+        "rhythm": _build_rhythm(shots, duration, total_cuts),
         "hook_cuts_0_3s": cuts_first_3s,
         "hook_cuts_0_10s": cuts_first_10s,
         "hook_cuts_0_30s": cuts_first_30s,

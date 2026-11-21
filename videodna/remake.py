@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-# v2.0.2: no OCR engine is installed on this machine (no `tesseract` binary;
-# no rapidocr / easyocr / pytesseract importable in the venv or system
-# python — checked 2026-11-21). Shot cards therefore MUST NOT claim any
-# on-screen text: every card states this explicitly until OCR is added.
-# OCR stays a documented gap, never a hard dependency.
+# v2.0.4: tesseract-ocr IS installed on this machine (system package,
+# 5.3.4 + eng/hin data, installed 2026-11-21 — see videodna/ocr.py).
+# Shot cards therefore carry real extracted text when the quality gate
+# passes; OCR_TEXT_STATUS below is only the fallback for shots where
+# no OCR ran (binary absent) or nothing was extracted. OCR stays
+# optional — never a hard dependency.
 OCR_TEXT_STATUS = "text not extracted (no OCR available)"
 
 # Units for the measured motion value carried on each shot card.
@@ -18,6 +19,7 @@ MOTION_UNITS = "mean abs luma diff per pixel, 0-255 scale, across the burst fram
 def build_shot_cards(
     forensics: dict[str, Any],
     fused: dict[str, Any] | None = None,
+    shot_frames: dict[int, dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build one measured content card per shot for the remake plan.
 
@@ -25,29 +27,49 @@ def build_shot_cards(
     described or invented:
     - duration / window: shot detector
     - production_type / confidence: per-shot forensics (fused when a visual
-      review exists)
+      review exists); production_runner_up: second-highest class in the
+      same per-shot distribution, so the mix is traceable to its shots
+      (v2.0.4 — like rea-video's per-shot top % + runner-up lines)
     - palette_hex: top-3 dominant colors of the shot's mid burst frame
       (4-bit histogram over the real pixels — see forensics._dominant_palette)
     - motion_mean_frame_diff: mean frame-to-frame luma difference inside
       the shot (forensics metrics)
-    - on_screen_text: only ever extracted text; with no OCR installed this
-      is always OCR_TEXT_STATUS — a missing measurement, stated as such.
+    - frame_paths: first/mid/last/strip JPEGs exported by
+      shots.export_shot_frames into dna/frames/ (v2.0.4; {} when the
+      export failed or the shot was not exported)
+    - on_screen_text: only ever extracted text; tesseract OCR (see
+      videodna/ocr.py) fills it when the quality gate passes, "no text
+      detected" when OCR ran but found nothing, and OCR_TEXT_STATUS
+      when no OCR ran at all.
     """
+    from videodna.forensics import _runner_up
+
     shot_list = (fused or forensics).get("per_shot", [])
     cards: list[dict[str, Any]] = []
     for sf in shot_list:
         m = sf.get("metrics") or {}
+        probs = sf.get("fused_probs") or sf.get("probs") or {}
+        top = sf.get("fused_type") or sf.get("predicted_type") or "unknown"
+        runner_up, runner_prob = _runner_up(probs, top)
         cards.append({
             "shot_id": sf["shot_id"],
             "start": sf["start"],
             "end": sf["end"],
             "duration": sf["duration"],
-            "production_type": sf.get("fused_type") or sf.get("predicted_type") or "unknown",
+            "production_type": top,
             "production_confidence": sf.get("fused_confidence") or sf.get("confidence"),
+            "production_runner_up": runner_up,
+            "production_runner_up_confidence": round(runner_prob, 3) if runner_up else None,
+            "needs_visual_review": bool(sf.get("needs_visual_review", False)),
+            "transition_subtype": sf.get("transition_subtype"),
+            "camera_motion": sf.get("camera_motion", "unknown"),
+            "camera_motion_confidence": sf.get("camera_motion_confidence", 0.0),
             "palette_hex": list(sf.get("palette_hex") or []),
             "motion_mean_frame_diff": m.get("mean_frame_diff"),
             "motion_units": MOTION_UNITS,
-            "on_screen_text": OCR_TEXT_STATUS,
+            "frame_paths": dict((shot_frames or {}).get(sf["shot_id"], {})),
+            "on_screen_text": sf.get("on_screen_text") or OCR_TEXT_STATUS,
+            "on_screen_text_words": list(sf.get("on_screen_text_words") or []),
         })
     return cards
 
@@ -103,6 +125,7 @@ def build_remake_plan(
     audio: dict[str, Any],
     color_dna: dict[str, Any],
     fused: dict[str, Any] | None = None,
+    shot_frames: dict[int, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Group consecutive same-type shots into minimal production batches."""
     shot_list = (fused or forensics).get("per_shot", [])
@@ -150,7 +173,7 @@ def build_remake_plan(
     return {
         "total_batches": len(batches),
         "batches": batches,
-        "shot_cards": build_shot_cards(forensics, fused=fused),
+        "shot_cards": build_shot_cards(forensics, fused=fused, shot_frames=shot_frames),
         "audio_pipeline": audio_plan,
         "color_pipeline": f"Apply auto-generated LUT `{color_dna.get('lut_file')}` ({color_dna.get('grade_style')}) + optional GPU upscale on Kaggle (only when the user asks).",
     }

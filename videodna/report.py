@@ -1,4 +1,4 @@
-"""Layered AI-Native DNA.md, blueprint.json, sub-docs (shots, remake_plan, SRT, comments), and report.html (v2.0.3)."""
+"""Layered AI-Native DNA.md, blueprint.json, sub-docs (shots, remake_plan, SRT, comments), and report.html (v2.0.4)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from videodna.forensics import _runner_up
 from videodna.remake import OCR_TEXT_STATUS
 
 
@@ -23,13 +24,18 @@ def _build_shot_cards(bp: dict[str, Any]) -> list[dict[str, Any]]:
 
     Every field is measured by the pipeline (shot detector, forensics burst,
     visual keyframes) — nothing is described or invented. On-screen text is
-    only ever text an OCR engine actually extracted; with no OCR installed
-    (see remake.OCR_TEXT_STATUS) every card states that plainly.
+    only ever text the quality-gated tesseract OCR actually extracted;
+    shots with no readable text say so, and when no OCR ran at all the
+    card states that plainly (see remake.OCR_TEXT_STATUS).
     """
     f_src = bp.get("fused_forensics") or bp.get("forensics") or {}
     f_map = {x["shot_id"]: x for x in f_src.get("per_shot", [])}
     vis_map = {v["shot_id"]: v for v in (bp.get("visual") or {}).get("shot_visuals", [])}
     rm_cards = {c["shot_id"]: c for c in (bp.get("remake_plan") or {}).get("shot_cards", [])}
+    shot_frames = {
+        s["id"]: dict(s.get("frame_paths") or {})
+        for s in (bp.get("shots") or {}).get("shots", [])
+    }
     cards: list[dict[str, Any]] = []
     for s in (bp.get("shots") or {}).get("shots", []):
         sid = s["id"]
@@ -38,14 +44,27 @@ def _build_shot_cards(bp: dict[str, Any]) -> list[dict[str, Any]]:
         rc = rm_cards.get(sid, {})
         m = fx.get("metrics") or {}
         conf = fx.get("fused_confidence") or fx.get("confidence")
+        probs = fx.get("fused_probs") or fx.get("probs") or {}
+        top = fx.get("fused_type") or fx.get("predicted_type") or "-"
+        runner_up, runner_prob = _runner_up(probs, top) if probs else (None, 0.0)
         cards.append({
             "shot_id": sid,
             "start": s["start"],
             "end": s["end"],
             "duration": s["duration"],
             "transition_in": s.get("transition_in", "-"),
-            "production_type": fx.get("fused_type") or fx.get("predicted_type") or "-",
+            "transition_subtype": s.get("transition_subtype") or fx.get("transition_subtype"),
+            "camera_motion": s.get("camera_motion") or fx.get("camera_motion") or "unknown",
+            "camera_motion_confidence": (
+                s.get("camera_motion_confidence")
+                if s.get("camera_motion_confidence") is not None
+                else fx.get("camera_motion_confidence", 0.0)
+            ),
+            "production_type": top,
             "production_confidence": conf,
+            "production_runner_up": runner_up,
+            "production_runner_up_confidence": round(runner_prob, 3) if runner_up else None,
+            "needs_visual_review": bool(fx.get("needs_visual_review", False)),
             "palette_hex": list(fx.get("palette_hex") or rc.get("palette_hex") or []),
             "motion_class": v.get("motion_class", "-"),
             "motion_energy": v.get("motion_energy"),
@@ -53,7 +72,13 @@ def _build_shot_cards(bp: dict[str, Any]) -> list[dict[str, Any]]:
             "mean_frame_diff": m.get("mean_frame_diff"),
             "mean_frame_diff_units": rc.get("motion_units")
             or "mean abs luma diff per pixel, 0-255 scale, across the burst frames inside the shot",
-            "on_screen_text": OCR_TEXT_STATUS,
+            "frame_paths": dict(shot_frames.get(sid) or rc.get("frame_paths") or {}),
+            "on_screen_text": (
+                s.get("on_screen_text") or fx.get("on_screen_text") or OCR_TEXT_STATUS
+            ),
+            "on_screen_text_words": list(
+                s.get("on_screen_text_words") or fx.get("on_screen_text_words") or []
+            ),
         })
     return cards
 
@@ -62,11 +87,27 @@ def _render_shot_card(card: dict[str, Any], heading: str) -> list[str]:
     """Render one measured shot card as markdown lines."""
     conf = card.get("production_confidence")
     conf_txt = f" ({int(round(float(conf) * 100))}% confidence)" if conf is not None else ""
+    runner_up = card.get("production_runner_up")
+    runner_txt = ""
+    if runner_up:
+        rp = card.get("production_runner_up_confidence")
+        rp_txt = f" ({int(round(float(rp) * 100))}%)" if rp is not None else ""
+        runner_txt = f" — runner-up: `{runner_up}`{rp_txt}"
+    review_txt = " ⚠️ low confidence — inspect visually" if card.get("needs_visual_review") else ""
     palette = card.get("palette_hex") or []
     palette_txt = (
         ", ".join(f"`{h}`" for h in palette)
         if palette else "not measured (no palette extracted for this shot)"
     )
+    frames = card.get("frame_paths") or {}
+    if frames:
+        frame_bits = []
+        for label in ("first", "mid", "last", "strip"):
+            if frames.get(label):
+                frame_bits.append(f"{label}: `{frames[label]}`")
+        frames_txt = " · ".join(frame_bits)
+    else:
+        frames_txt = "not exported (frame export failed or unavailable)"
     motion_bits = []
     if card.get("motion_class") not in (None, "-"):
         motion_bits.append(f"`{card['motion_class']}`")
@@ -79,12 +120,26 @@ def _render_shot_card(card: dict[str, Any], heading: str) -> list[str]:
             f"mean frame diff inside shot {card['mean_frame_diff']} "
             f"({card.get('mean_frame_diff_units', '')})"
         )
+    cam = card.get("camera_motion")
+    if cam:
+        cam_conf = card.get("camera_motion_confidence")
+        cam_txt = f"camera motion `{cam}`"
+        if cam != "unknown" and cam_conf is not None:
+            cam_txt += f" (confidence {float(cam_conf):.2f})"
+        elif cam == "unknown":
+            cam_txt += " (not classifiable from the burst — see v2.0.4 notes)"
+        motion_bits.append(cam_txt)
     motion_txt = " — ".join(motion_bits) if motion_bits else "not measured"
+    subtype = card.get("transition_subtype")
+    transition_txt = f"`{card.get('transition_in', '-')}`"
+    if subtype:
+        transition_txt += f" ({subtype})"
     return [
         heading,
         f"- **Window:** {card['start']:.2f}–{card['end']:.2f}s ({card['duration']:.2f}s)",
-        f"- **Transition in:** `{card.get('transition_in', '-')}`",
-        f"- **Production call:** `{card.get('production_type', '-')}`{conf_txt}",
+        f"- **Transition in:** {transition_txt}",
+        f"- **Production call:** `{card.get('production_type', '-')}`{conf_txt}{runner_txt}{review_txt}",
+        f"- **Frames (first / mid / last / strip):** {frames_txt}",
         f"- **Dominant colors (measured, mid-shot frame):** {palette_txt}",
         f"- **Motion:** {motion_txt}",
         f"- **On-screen text:** {card.get('on_screen_text', OCR_TEXT_STATUS)}",
@@ -210,8 +265,20 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
     )
 
     audio_score_disp = "N/A (silent)" if d["scores"]["audio_dynamics"] is None else f"`{d['scores']['audio_dynamics']}`"
+    rhythm = sh.get("rhythm") or {}
+    rhythm_line = ""
+    if rhythm:
+        longest = rhythm.get("longest_shot") or {}
+        shortest = rhythm.get("shortest_shot") or {}
+        rhythm_line = (
+            f"- **Rhythm:** median shot `{rhythm.get('shot_length_median_sec', '-')}s` "
+            f"· `{rhythm.get('cuts_per_10s', '-')} cuts/10s` "
+            + (f"· longest `#{longest.get('shot_id')}` ({longest.get('duration', '-')}s) "
+               f"· shortest `#{shortest.get('shot_id')}` ({shortest.get('duration', '-')}s)" if longest else "")
+            + " — full pacing curve + transitions list in `dna/shots.md`"
+        )
     lines = [
-        f"# VideoDNA v2.0.3 Report — `{p['filename']}`",
+        f"# VideoDNA v2.0.4 Report — `{p['filename']}`",
         "",
         "## 1. Executive Telemetry & Production Verdict",
         f"- **How It Was Made ({verdict_tag}):** **{verdict_str}** (Confidence: **{verdict_conf}%**)",
@@ -223,6 +290,8 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
         f"- **Audio Forensics:** {audio_line}",
         f"- **Color DNA:** `{v['color_dna']['grade_style']}` · Palette: `{', '.join(v['color_dna']['palette_hex'])}` · 3D LUT: `{v['color_dna']['lut_file']}`",
     ]
+    if rhythm_line:
+        lines.append(rhythm_line)
 
     if meta.get("title"):
         lines.append(
@@ -240,18 +309,21 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
         for cf in fused["conflicts"]:
             lines.append(f"  - Shot #{cf['shot_id']}: Tool `{cf['tool_call']}` vs Agent `{cf['agent_call']}`")
 
-    lines.append("| Shot | Window | Transition In | Production Call | Conf | Noise | Flat% | 2D Coh | Evidence |")
-    lines.append("|---:|---|---|---|---:|---:|---:|---:|---|")
+    lines.append("| Shot | Window | Transition In | Production Call | Conf | Runner-up | Noise | Flat% | 2D Coh | Evidence |")
+    lines.append("|---:|---|---|---|---:|---|---:|---:|---:|---|")
     for sf in (verdict_src.get("per_shot") or [])[:20]:
         sh_match = next((x for x in sh["shots"] if x["id"] == sf["shot_id"]), {})
         m = sf.get("metrics") or {}
         lbl = sf.get("fused_type") or sf.get("predicted_type")
         conf_p = int(round(float(sf.get("fused_confidence") or sf.get("confidence") or 0) * 100))
+        probs = sf.get("fused_probs") or sf.get("probs") or {}
+        ru, rp = _runner_up(probs, lbl) if probs else (None, 0.0)
+        ru_txt = f"`{ru}` ({int(round(float(rp) * 100))}%)" if ru else "-"
         ev = (sf.get("evidence") or [""])[0][:75]
         coh_str = "static" if float(m.get("mean_frame_diff", 0)) < 1.0 else f"{int(float(m.get('planar_coherence', 0))*100)}%"
         lines.append(
             f"| #{sf['shot_id']:02d} | {sf['start']:.1f}–{sf['end']:.1f}s ({sf['duration']:.1f}s) "
-            f"| `{sh_match.get('transition_in', '-')}` | **`{lbl}`** | {conf_p}% "
+            f"| `{sh_match.get('transition_in', '-')}` | **`{lbl}`** | {conf_p}% | {ru_txt} "
             f"| {m.get('sensor_noise', '-')} | {int(float(m.get('flat_region_ratio', 0))*100)}% "
             f"| {coh_str} | {ev} |"
         )
@@ -274,7 +346,7 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
             lines.append(f"| B{b['batch_id']} | {s_ids} | {b['start']:.1f}–{b['end']:.1f}s ({b['total_duration']}s) | `{b['production_type']}` | {b['tool']} |")
         lines.append(f"- **Audio Route:** {rm.get('audio_pipeline', '')}")
         lines.append(f"- **Color Route:** {rm.get('color_pipeline', '')}")
-        lines.append("- **Per-Shot Content Cards:** measured duration, transition, dominant colors, motion and on-screen text for every shot — see `dna/remake_plan.md` and `dna/shots.md` (no descriptions invented; on-screen text is listed only if OCR extracted it — none is installed).")
+        lines.append("- **Per-Shot Content Cards:** measured duration, transition, dominant colors, motion and on-screen text for every shot — see `dna/remake_plan.md` and `dna/shots.md` (no descriptions invented; on-screen text is listed only if the quality-gated tesseract OCR extracted it — shots with no readable text say so).")
 
     lines += ["", f"## {sec}. Retention Audit & Beat-The-Original Signals"]
     sec += 1
@@ -335,15 +407,67 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
         "|---|---|",
         "| `hook_strip.jpg` | Opening critical seconds frame strip (inspect FIRST!) |",
         "| `storyboard.jpg` | Labeled keyframe contact sheet across all shots |",
+        "| `frames/` | Visual keyframes: `shot_NNN_mid.jpg` per sampled shot (visual.py; sampled ≤24 shots) |",
+        "| `dna/frames/` | Per-shot remake frames for EVERY shot: `shot-NN-first.jpg`, `shot-NN-mid.jpg`, `shot-NN-last.jpg`, `shot-NN-strip.jpg` (contact strip, shots ≥1s) — referenced per shot in `blueprint.json` (`frame_paths`) and on each shot card |",
         "| `audio_timeline.png` | Audio energy curve / silent indicator + yellow cut markers |",
         "| `reference_grade.cube` | Auto-generated 17×17×17 3D color LUT |",
-        "| `dna/shots.md` | Complete shot table + physical forensic metrics + dead-zones + measured per-shot content cards |",
+        "| `dna/shots.md` | Complete shot table + physical forensic metrics + dead-zones + rhythm/pacing section + measured per-shot content cards |",
         "| `dna/remake_plan.md` | Model-aware batched remake strategy & tool routing + per-shot content cards |",
         "| `dna/transcript.md` | Timestamped transcript (+ `dna/captions.srt` when present) |",
         "| `dna/comments.md` | Mined viewer complaints, questions, requests & timestamps |",
         "| `report.html` | Interactive offline dark-mode visual dashboard |",
     ]
     return "\n".join(lines) + "\n"
+
+
+def _render_rhythm_lines(sh: dict[str, Any]) -> list[str]:
+    """Rhythm/pacing section (v2.0.4) from shots["rhythm"] — full shot list,
+    no sampling caps. Returns [] when the block is absent (old blueprints)."""
+    r = sh.get("rhythm") or {}
+    if not r:
+        return []
+    longest = r.get("longest_shot") or {}
+    shortest = r.get("shortest_shot") or {}
+    lines = [
+        "## Rhythm & Pacing (v2.0.4 — full shot list)",
+        "",
+        f"- **Shot length:** min `{r.get('shot_length_min_sec', '-')}s` · median `{r.get('shot_length_median_sec', '-')}s` · max `{r.get('shot_length_max_sec', '-')}s` · avg `{sh.get('avg_shot_length_sec', '-')}s`",
+    ]
+    if longest:
+        lines.append(
+            f"- **Longest shot:** `#{longest.get('shot_id')}` {longest.get('start', '-')}–{longest.get('end', '-')}s ({longest.get('duration', '-')}s)"
+        )
+    if shortest:
+        lines.append(
+            f"- **Shortest shot:** `#{shortest.get('shot_id')}` {shortest.get('start', '-')}–{shortest.get('end', '-')}s ({shortest.get('duration', '-')}s)"
+        )
+    lines.append(
+        f"- **Cut density:** `{r.get('cuts_per_10s', '-')} cuts/10s` · `{sh.get('cuts_per_minute', '-')} cuts/min` "
+        f"· `{sh.get('hard_cuts', 0)} hard cuts` + `{sh.get('soft_transitions', 0)} soft transitions`"
+    )
+    curve = r.get("pacing_curve") or []
+    if curve:
+        lines.append("")
+        lines.append("| 10s Window | Shots Starting | Cuts |")
+        lines.append("|---|---:|---:|")
+        for w in curve:
+            lines.append(
+                f"| {w['window_start']:.1f}–{w['window_end']:.1f}s | {w['shots']} | {w['cuts']} |"
+            )
+    transitions = r.get("transitions") or []
+    if transitions:
+        lines.append("")
+        lines.append("### Transitions (time → into shot → type; subtype in brackets when measured; duration not measured)")
+        lines.append("")
+        lines.append("| Time | Into Shot | Type |")
+        lines.append("|---:|---|---:|")
+        for tr in transitions:
+            type_txt = f"`{tr['type']}`"
+            if tr.get("subtype"):
+                type_txt += f" ({tr['subtype']})"
+            lines.append(f"| {tr['time']:.2f}s | #{tr['into_shot']:02d} | {type_txt} |")
+    lines.append("")
+    return lines
 
 
 def _render_shots_md(bp: dict[str, Any]) -> str:
@@ -355,8 +479,8 @@ def _render_shots_md(bp: dict[str, Any]) -> str:
     lines = [
         f"# Shot-by-Shot Forensic Timeline ({sh['shot_count']} shots | Mode: {sh['mode']})",
         "",
-        "| Shot | Window | Dur | Transition | Predicted Type | Conf | Motion | Noise | Flat% | Keyframe |",
-        "|---:|---|---:|---|---|---:|---|---:|---:|---|",
+        "| Shot | Window | Dur | Transition | Predicted Type | Conf | Runner-up | Motion | Noise | Flat% | Keyframe |",
+        "|---:|---|---:|---|---|---:|---|---|---:|---:|---|",
     ]
     for s in sh["shots"]:
         v = vis_map.get(s["id"], {})
@@ -364,11 +488,15 @@ def _render_shots_md(bp: dict[str, Any]) -> str:
         m = fx.get("metrics") or {}
         ptype = fx.get("fused_type") or fx.get("predicted_type") or "-"
         conf = f"{int(round(float(fx.get('fused_confidence') or fx.get('confidence') or 0)*100))}%" if fx else "-"
+        probs = fx.get("fused_probs") or fx.get("probs") or {}
+        ru, rp = _runner_up(probs, ptype) if probs else (None, 0.0)
+        ru_txt = f"`{ru}` ({int(round(float(rp) * 100))}%)" if ru else "-"
         lines.append(
             f"| #{s['id']:02d} | {s['start']:.2f}–{s['end']:.2f}s | {s['duration']:.2f}s | `{s.get('transition_in', '-')}` "
-            f"| `{ptype}` | {conf} | {v.get('motion_class', '-')} ({v.get('motion_energy', '-')}) "
+            f"| `{ptype}` | {conf} | {ru_txt} | {v.get('motion_class', '-')} ({v.get('motion_energy', '-')}) "
             f"| {m.get('sensor_noise', '-')} | {int(float(m.get('flat_region_ratio', 0))*100)}% | `{v.get('keyframe') or '-'}` |"
         )
+    lines += [""] + _render_rhythm_lines(sh)
     true_dz = bp["diagnostics"].get("true_dead_zones") or []
     if true_dz:
         lines += ["", "## True Static Dead-Zones (Retention Drop-Off Risks)"]
@@ -383,8 +511,9 @@ def _render_shots_md(bp: dict[str, Any]) -> str:
         "Each card carries only pipeline-measured values: window/duration and",
         "transition from the shot detector, dominant colors from the shot's",
         "mid-frame pixels, motion from keyframe/burst frame differences, and",
-        "on-screen text ONLY if an OCR engine actually extracted it (none is",
-        "installed — see the per-card note). Use these cards, not the generic",
+        "on-screen text ONLY if the quality-gated tesseract OCR actually",
+        "extracted it (shots with no readable text say so; see the",
+        "per-card note). Use these cards, not the generic",
         "batch strategy, to rebuild each shot.",
         "",
     ]
@@ -496,10 +625,13 @@ def _render_html_report(bp: dict[str, Any]) -> str:
         m = sf.get("metrics") or {}
         lbl = html.escape(str(sf.get("fused_type") or sf.get("predicted_type")))
         cp = int(round(float(sf.get("fused_confidence") or sf.get("confidence") or 0) * 100))
+        probs = sf.get("fused_probs") or sf.get("probs") or {}
+        ru, rp = _runner_up(probs, sf.get("fused_type") or sf.get("predicted_type")) if probs else (None, 0.0)
+        ru_txt = f" (2nd: {html.escape(str(ru))} {int(round(float(rp) * 100))}%)" if ru else ""
         shot_rows += (
             f"<tr><td>#{sf['shot_id']:02d}</td><td>{sf['start']:.1f}–{sf['end']:.1f}s ({sf['duration']:.1f}s)</td>"
             f"<td><code>{html.escape(str(sh_m.get('transition_in', '-')))}</code></td>"
-            f"<td><b>{lbl}</b> ({cp}%)</td>"
+            f"<td><b>{lbl}</b> ({cp}%){ru_txt}</td>"
             f"<td>{m.get('sensor_noise', '-')}</td><td>{int(float(m.get('flat_region_ratio', 0))*100)}%</td></tr>"
         )
 
@@ -534,7 +666,7 @@ def _render_html_report(bp: dict[str, Any]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VideoDNA v2.0.3 — {title}</title>
+<title>VideoDNA v2.0.4 — {title}</title>
 <style>
   :root {{ --bg:#0b0f19; --card:#131a2a; --border:#23304d; --text:#e6edf8; --muted:#8fa3c7; --accent:#58a6ff; }}
   * {{ box-sizing:border-box; }}
@@ -568,7 +700,7 @@ def _render_html_report(bp: dict[str, Any]) -> str:
 <div class="wrap">
   <header>
     <div>
-      <span class="badge">VideoDNA v2.0.3 · {sh['mode'].upper()} MODE</span>
+      <span class="badge">VideoDNA v2.0.4 · {sh['mode'].upper()} MODE</span>
       <h1>{title}</h1>
     </div>
     <div>

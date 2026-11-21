@@ -1,4 +1,4 @@
-"""VideoDNA v2.0.3 CLI — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine."""
+"""VideoDNA v2.0.4 CLI — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine."""
 
 from __future__ import annotations
 
@@ -15,18 +15,58 @@ from typing import Any
 from videodna import __version__
 from videodna.audio import analyze_audio
 from videodna.diagnostics import compute_diagnostics
-from videodna.forensics import fuse_review_probabilities, run_shot_forensics
+from videodna.forensics import (
+    classify_camera_motion_for_shots,
+    fuse_review_probabilities,
+    run_shot_forensics,
+)
 from videodna.ingest import find_yt_dlp, ingest_url, is_url, parse_subtitle_file, transcribe_local
+from videodna.ocr import OCR_NO_TEXT, extract_shot_text, tesseract_available
 from videodna.probe import probe_video
 from videodna.remake import build_remake_plan
 from videodna.report import write_outputs
-from videodna.shots import detect_shots
+from videodna.shots import detect_shots, export_shot_frames
 from videodna.vault import crack_channel_patterns, fuse_dna, list_vault, save_to_vault
 from videodna.visual import analyze_visuals
 
 
 def _safe_slug(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "_", text).strip("_")[:48] or "video"
+
+
+def _attach_shot_labels(
+    shots: dict[str, Any],
+    forensics: dict[str, Any],
+    video_path: Path,
+) -> None:
+    """Attach v2.0.4 per-shot labels to the shot dicts + forensics entries.
+
+    - camera_motion (item 4): run_shot_forensics() labels the sampled
+      shots in its own loop; the unsampled remainder (shots beyond the
+      32/24 cap) is classified here with the same burst + classifier,
+      so every shot dict carries a value. Forensics entries already
+      carry theirs; they are not touched.
+    - transition_subtype (item 3): set on the shot dicts by
+      detect_shots(); copied onto the forensics entries so the remake
+      cards (built from forensics) can carry it.
+    Defaults are "unknown" (camera) / None (subtype). Labelling only.
+    """
+    shot_list = shots.get("shots", [])
+    fx_map = {x["shot_id"]: x for x in forensics.get("per_shot", [])}
+    missing = [s for s in shot_list if s["id"] not in fx_map]
+    extra = classify_camera_motion_for_shots(video_path, missing) if missing else {}
+    for s in shot_list:
+        sid = int(s["id"])
+        fx = fx_map.get(sid)
+        if fx is not None:
+            s["camera_motion"] = fx.get("camera_motion", "unknown")
+            s["camera_motion_confidence"] = fx.get("camera_motion_confidence", 0.0)
+        else:
+            cm = extra.get(sid, {})
+            s["camera_motion"] = cm.get("camera_motion", "unknown")
+            s["camera_motion_confidence"] = cm.get("camera_motion_confidence", 0.0)
+        if fx is not None and s.get("transition_subtype"):
+            fx["transition_subtype"] = s["transition_subtype"]
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
@@ -71,6 +111,53 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     print("[VideoDNA] 3/5 Running mathematical per-shot production forensics (noise, flatness, cadence, 2D coherence)...")
     forensics = run_shot_forensics(video_path, probe, shots, mode=mode)
 
+    # v2.0.4 item 4: camera motion is computed inside run_shot_forensics
+    # for the sampled shots; cover the unsampled remainder here so EVERY
+    # shot dict carries a camera_motion value (labelling only — no
+    # scoring input, no verdict change). Also copy the transition
+    # subtype (item 3, set on the shot dicts by detect_shots) onto the
+    # forensics entries so the remake cards can carry it.
+    _attach_shot_labels(shots, forensics, video_path)
+
+    # v2.0.4: export first/mid/last (+strip) frames for EVERY shot in one
+    # streaming pass; paths land on each shot dict so blueprint.json,
+    # dna/shots.md and dna/remake_plan.md all reference the same files.
+    print("[VideoDNA] 3b/5 Exporting per-shot first/mid/last frames (dna/frames/)...")
+    shot_frames = export_shot_frames(
+        video_path, shots["shots"], out_dir,
+        fps=probe.get("avg_fps") or 30.0,
+        orig_width=probe.get("width"), orig_height=probe.get("height"),
+    )
+    for s in shots["shots"]:
+        s["frame_paths"] = dict(shot_frames.get(s["id"], {}))
+
+    # v2.0.4 item 6: on-screen text via the tesseract CLI (system
+    # package, no pip dependency). One mid frame per shot, quality-gated
+    # (see videodna/ocr.py) — garbage never reaches the cards. When
+    # tesseract is absent this is a no-op and the cards keep stating
+    # that no OCR is available.
+    if tesseract_available():
+        import time as _time
+        _ocr_t0 = _time.monotonic()
+        print("[VideoDNA] 3c/5 Extracting on-screen text per shot (tesseract OCR)...")
+        ocr_texts = extract_shot_text(video_path, shots["shots"])
+        if ocr_texts:
+            for s in shots["shots"]:
+                entry = ocr_texts.get(s["id"])
+                if entry is None:
+                    continue
+                s["on_screen_text"] = entry["text"] or OCR_NO_TEXT
+                s["on_screen_text_words"] = list(entry["words"])
+            for sf in forensics.get("per_shot", []):
+                entry = ocr_texts.get(sf["shot_id"])
+                if entry is None:
+                    continue
+                sf["on_screen_text"] = entry["text"] or OCR_NO_TEXT
+                sf["on_screen_text_words"] = list(entry["words"])
+            print(f"[VideoDNA] OCR done in {_time.monotonic() - _ocr_t0:.1f}s "
+                  f"({len(ocr_texts)} shots, "
+                  f"{sum(1 for e in ocr_texts.values() if e['text'])} with text).")
+
     print("[VideoDNA] 4/5 Extracting keyframes, motion energy, color DNA & 3D .cube LUT...")
     visual = analyze_visuals(video_path, shots, out_dir, mode=mode)
 
@@ -84,7 +171,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         probe, shots, visual, audio, comments_intel=comments_intel, forensics=forensics
     )
     shots["dead_zones"] = diagnostics["effective_dead_zones"]
-    remake_plan = build_remake_plan(forensics, audio, visual["color_dna"])
+    remake_plan = build_remake_plan(
+        forensics, audio, visual["color_dna"], shot_frames=shot_frames
+    )
 
     blueprint: dict[str, Any] = {
         "schema_version": "videodna/2.0",
@@ -117,7 +206,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         + (f" | ~{audio['estimated_bpm']} BPM" if audio.get("estimated_bpm") else "")
     )
 
-    print("\n=== VideoDNA v2.0.3 Analysis Complete ===")
+    print("\n=== VideoDNA v2.0.4 Analysis Complete ===")
     print(f"How It Was Made: {forensics['verdict_summary']} (Confidence: {conf_pct}%)")
     print(f"Mode / Size:     {mode.upper()} ({probe['duration_sec']}s, {probe['width']}x{probe['height']})")
     print(f"Shots Detected:  {shots['shot_count']} ({shots.get('hard_cuts', 0)} hard cuts + {shots.get('soft_transitions', 0)} soft transitions) | ASL {shots['avg_shot_length_sec']}s")
@@ -145,8 +234,15 @@ def cmd_apply_review(args: argparse.Namespace) -> int:
     if blueprint.get("forensics"):
         fused = fuse_review_probabilities(blueprint["forensics"], review)
         blueprint["fused_forensics"] = fused
+        # v2.0.4: keep the frame paths recorded on the shots in the
+        # blueprint (apply-review re-renders the cards from them).
+        shot_frames = {
+            int(s["id"]): dict(s.get("frame_paths") or {})
+            for s in (blueprint.get("shots") or {}).get("shots", [])
+        }
         blueprint["remake_plan"] = build_remake_plan(
-            blueprint["forensics"], blueprint["audio"], blueprint["visual"]["color_dna"], fused=fused
+            blueprint["forensics"], blueprint["audio"], blueprint["visual"]["color_dna"],
+            fused=fused, shot_frames=shot_frames,
         )
         print(
             f"[VideoDNA] Fused Verdict: {fused['verdict_summary']} "
@@ -280,7 +376,7 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="videodna",
-        description="VideoDNA v2.0.3 — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine.",
+        description="VideoDNA v2.0.4 — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine.",
     )
     p.add_argument("--version", action="version", version=f"videodna {__version__}")
     sub = p.add_subparsers(dest="command", required=True)

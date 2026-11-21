@@ -51,6 +51,75 @@ def _dominant_palette(frame_rgb: np.ndarray, k: int = 3) -> list[str]:
     return out
 
 
+def aggregate_mix(
+    shot_entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Duration-weighted MEAN-SOFTMAX production mix (v2.0.4).
+
+    Each shot contributes its FULL per-shot softmax distribution, weighted by
+    its duration — not just its single top label. Two reasons this replaces
+    the v2.0.2 winner-take-all breakdown:
+
+    1. "unknown" is not a production method — it is the per-shot label when
+       no rule fired or the top two classes nearly tied. Winner-take-all
+       dumped ALL of an unknown shot's duration into that bucket, so a
+       mixed video like speech2 read "unknown 48%" and hid the real live /
+       3D / AI mass underneath. The mean softmax keeps the mass: an unknown
+       shot still spreads its (near-uniform) distribution across the real
+       classes instead of swallowing half the video.
+    2. Minority mass is preserved: a video that is 70% live + 30% 3D reads
+       as that mix, instead of the 3D shots' evidence vanishing whenever
+       they are not the top label of enough shots.
+
+    Trade-off, stated plainly: a video that really is one production method
+    no longer reads a clean "code_motion 100%" — it reads the mean softmax
+    (e.g. code_motion ~90% + small softmax residue on the other classes),
+    because the per-shot classifier is never 100% sure. The per-shot cards
+    (top label + runner-up + confidence) stay the traceable ground truth;
+    overall_confidence is unchanged (duration-weighted mean of per-shot
+    confidence) and still gates the "uncertain from pixels alone" wording.
+
+    shot_entries: {"duration": float, "probs": {cat: p}, "confidence": float}.
+    Returns {"duration_weighted_pct": {all 6 cats, 1dp, desc},
+             "overall_probs": {all 6 cats, 3dp}, "overall_confidence": float}.
+    """
+    weighted: dict[str, float] = {k: 0.0 for k in CATEGORIES}
+    total_dur = 0.0
+    conf_sum = 0.0
+    for entry in shot_entries:
+        dur = max(0.1, float(entry.get("duration", 0.0)))
+        probs = entry.get("probs") or {}
+        for k in CATEGORIES:
+            weighted[k] += float(probs.get(k, 0.0)) * dur
+        total_dur += dur
+        conf_sum += float(entry.get("confidence", 0.0)) * dur
+    if total_dur <= 0:
+        return {
+            "duration_weighted_pct": {},
+            "overall_probs": {k: 0.0 for k in CATEGORIES},
+            "overall_confidence": 0.0,
+        }
+    overall_probs = {k: round(float(v / total_dur), 3) for k, v in weighted.items()}
+    breakdown_pct = {
+        k: round((v / total_dur) * 100.0, 1)
+        for k, v in sorted(weighted.items(), key=lambda kv: -kv[1])
+    }
+    return {
+        "duration_weighted_pct": breakdown_pct,
+        "overall_probs": overall_probs,
+        "overall_confidence": round(conf_sum / total_dur, 2),
+    }
+
+
+def _runner_up(probs: dict[str, float], top_label: str) -> tuple[str | None, float]:
+    """Second-highest class in a probability dict (None if none exists)."""
+    ranked = sorted(
+        ((k, float(v)) for k, v in (probs or {}).items() if k != top_label),
+        key=lambda kv: -kv[1],
+    )
+    return (ranked[0] if ranked else (None, 0.0))
+
+
 def honest_verdict_summary(
     breakdown_pct: dict[str, float],
     overall_probs: dict[str, float],
@@ -59,23 +128,30 @@ def honest_verdict_summary(
     """Build the verdict label, refusing to assert a type at low confidence.
 
     Returns (verdict_summary, verdict_uncertain, runner_up_label).
-    - confidence >= 0.5 (or an already-honest "unknown" top call): the usual
-      "code_motion 100%" / "live 60% + ai_video 40%" wording, unchanged.
-    - confidence < 0.5: "code_motion / static_zoom — uncertain from pixels
-      alone", where the runner-up is the real second-highest class from the
-      duration-weighted overall probabilities — never invented.
+    - confidence >= 0.5 (or an already-honest "unknown" top call): the full
+      duration-weighted mix, every label with >= 1% share, e.g.
+      "live 28% + 3d_render 19% + code_motion 18% + ai_video 14%".
+    - confidence < 0.5: the same full mix, suffixed with
+      "— uncertain from pixels alone", where the runner-up is the real
+      second-highest class from the duration-weighted overall
+      probabilities — never invented. (v2.0.2's short "top / runner_up"
+      form could not name the live share AND the AI/3D share of a mixed
+      video like speech2, so v2.0.4 shows the whole mix and keeps the
+      uncertainty qualifier.)
     """
     if not breakdown_pct:
         return "indeterminate", False, None
     top_label = next(iter(breakdown_pct))
-    summary = " + ".join(f"{k} {v:.0f}%" for k, v in list(breakdown_pct.items())[:3])
+    mix_entries = [(k, v) for k, v in breakdown_pct.items() if v >= 1.0]
+    if not mix_entries:
+        mix_entries = list(breakdown_pct.items())[:1]
+    summary = " + ".join(f"{k} {v:.0f}%" for k, v in mix_entries)
     if top_label == "unknown" or overall_conf >= LOW_CONFIDENCE_VERDICT_THRESHOLD:
         return summary, False, None
-    ranked = sorted(overall_probs.items(), key=lambda kv: -kv[1])
-    runner_up = next((k for k, _ in ranked if k != top_label), None)
+    runner_up, _ = _runner_up(overall_probs, top_label)
     if runner_up is None:
         return summary, False, None
-    return f"{top_label} / {runner_up} — uncertain from pixels alone", True, runner_up
+    return f"{summary} — uncertain from pixels alone", True, runner_up
 
 
 def _decode_burst_rgb(
@@ -138,6 +214,150 @@ def _color_entropy(frame_rgb: np.ndarray) -> float:
     probs /= probs.sum()
     ent = -np.sum(probs * np.log2(probs))
     return float(ent / 12.0)  # normalized 0..1
+
+
+def _phase_shift(f1: np.ndarray, f2: np.ndarray) -> tuple[int, int, float, float]:
+    """True global translation between two luma frames via FFT phase correlation.
+
+    Returns (dx, dy, coherence, raw_diff) where (dx, dy) is the shift of
+    f2 relative to f1 in pixels (positive dx = content moved right) and
+    coherence is 1 - aligned_diff/raw_diff after shifting f1 by (dx, dy)
+    (0 when the shift does not explain the change).
+
+    SIGN NOTE (verified on synthetic rolls, 2026-11-21): the FFT peak of
+    fa * conj(fb) is the NEGATED true shift — rolling an image by
+    (dy=2, dx=3) peaks at (-3, -2), and shifting by the peak gives
+    coherence 0.0 while shifting by the negated peak gives 1.0. This
+    helper negates the peak, so it returns the true shift. The older
+    _planar_motion_coherence() below has the same sign issue (it shifts
+    by the raw peak, so real pans score coherence 0.0) — it is left
+    untouched on purpose: its coherence value feeds the production
+    scoring rules, and fixing it would change verdicts. Camera-motion
+    classification uses THIS helper only; no scoring rule reads it.
+    """
+    raw_diff = float(np.mean(np.abs(f2 - f1)))
+    if raw_diff < 0.8:
+        return 0, 0, 0.0, raw_diff
+    a = f1 - f1.mean()
+    b = f2 - f2.mean()
+    fa = np.fft.rfft2(a)
+    fb = np.fft.rfft2(b)
+    cross = fa * np.conj(fb)
+    corr = np.fft.irfft2(cross / (np.abs(cross) + 1e-6), s=a.shape)
+    py, px = np.unravel_index(np.argmax(corr), corr.shape)
+    h, w = a.shape
+    dy = int(py if py <= h // 2 else py - h)
+    dx = int(px if px <= w // 2 else px - w)
+    dx, dy = -dx, -dy  # FFT peak is the negated true shift (see note above)
+    if abs(dx) > w // 3 or abs(dy) > h // 3:
+        return dx, dy, 0.0, raw_diff
+    shifted = np.roll(np.roll(f1, dy, axis=0), dx, axis=1)
+    m = max(abs(dy), abs(dx), 2)
+    if h - 2 * m < 10 or w - 2 * m < 10:
+        return dx, dy, 0.0, raw_diff
+    aligned_diff = float(np.mean(np.abs(f2[m:-m, m:-m] - shifted[m:-m, m:-m])))
+    coherence = float(np.clip(1.0 - (aligned_diff / max(raw_diff, 1e-3)), 0.0, 1.0))
+    return dx, dy, coherence, raw_diff
+
+
+# v2.0.4 camera-motion rules (item 4): static and pan only, asserted on
+# strong evidence; everything else is "unknown" (see _camera_motion_from_burst).
+CAMERA_STATIC_MAX_MEAN_DIFF = 1.0  # same static line as the forensics scorer
+CAMERA_PAN_MIN_PAIRS = 3           # usable (moving, coherent) pairs required
+CAMERA_PAN_MIN_SHIFT_PX = 1        # median |shift| on the dominant axis (160px frame)
+CAMERA_PAN_MIN_AGREEMENT = 0.70    # fraction of usable pairs sharing the pan sign
+CAMERA_PAN_MIN_COHERENCE = 0.5     # mean corrected-coherence of the usable pairs
+
+
+def _camera_motion_from_burst(lumas: np.ndarray) -> tuple[str, float]:
+    """Classify camera motion from a burst of consecutive luma frames.
+
+    Labels (confidence in parentheses):
+    - "static" (0.9): mean frame-to-frame luma diff below the forensics
+      static line (1.0) — the same rule the production scorer uses.
+    - "pan" (agreement fraction): >= 3 usable pairs (raw diff >= 0.8,
+      corrected coherence >= 0.4) whose true shifts share one dominant
+      axis, one sign (>= 70% agreement, each within 1px of the median
+      shift), a median shift >= 1px, a near-zero orthogonal median
+      (<= 1px), and mean coherence >= 0.5. A real pan is a steady
+      translation; anything else fails one of these.
+    - "unknown" (0.0): everything else — most shots land here, and that
+      is the correct output, not a failure to decide.
+
+    NOT classified (measured, not assumed — see CHANGELOG v2.0.4):
+    - zoom: no cheap test separates it. Centre-vs-edge diff ratio was
+      1.50 on a synthetic zoom vs 1.89 on a synthetic pan (no gap), and
+      a centre-scale search gave residual >= raw diff even on a clean
+      synthetic zoom (resampling a high-frequency test pattern swamps
+      the zoom signal). Zoom stays "unknown".
+    - handheld: a synthetic +-6px random-walk jitter is invisible at
+      the burst resolution (160x90, 12fps): every pair reads shift (0,0)
+      with coherence 0.0 and raw diffs 0.3-1.7 — below the noise floor.
+      Handheld stays "unknown".
+    - multi-layer motion graphics (U1/U3), flat/textureless frames
+      (multi.mp4/test.mp4: no phase peak exists), and subject/overlay
+      motion (U4, U2) all fail the pan gates and read "unknown".
+
+    Limitation, stated plainly: the burst is ~1s centred in the shot,
+    so a slow pan/zoom that moves < 1px/frame at 160px is below the
+    noise floor and reads "unknown", and a pan that starts late in a
+    long shot can be missed entirely.
+    """
+    if lumas is None or len(lumas) < 3:
+        return "unknown", 0.0
+    pairs: list[tuple[int, int, float, float]] = []
+    for i in range(len(lumas) - 1):
+        dx, dy, coh, raw = _phase_shift(lumas[i], lumas[i + 1])
+        pairs.append((dx, dy, coh, raw))
+    mean_diff = float(np.mean([p[3] for p in pairs])) if pairs else 0.0
+    if mean_diff < CAMERA_STATIC_MAX_MEAN_DIFF:
+        return "static", 0.9
+    usable = [p for p in pairs if p[3] >= 0.8 and p[2] >= 0.4]
+    if len(usable) < CAMERA_PAN_MIN_PAIRS:
+        return "unknown", 0.0
+    mean_coh = float(np.mean([p[2] for p in usable]))
+    if mean_coh < CAMERA_PAN_MIN_COHERENCE:
+        return "unknown", 0.0
+    for axis in (0, 1):
+        vals = [p[axis] for p in usable]
+        other = [p[1 - axis] for p in usable]
+        med = float(np.median(np.abs(vals)))
+        if med < CAMERA_PAN_MIN_SHIFT_PX:
+            continue
+        if float(np.median(np.abs(other))) > 1.0:
+            continue
+        sign = 1 if float(np.median(vals)) > 0 else -1
+        agree = [
+            v for v in vals
+            if (v > 0) == (sign > 0) and abs(abs(v) - med) <= 1.0
+        ]
+        if len(agree) / len(vals) >= CAMERA_PAN_MIN_AGREEMENT:
+            return "pan", round(len(agree) / len(vals), 2)
+    return "unknown", 0.0
+
+
+def classify_camera_motion_for_shots(
+    video_path: Path,
+    shots: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    """Camera-motion labels for shots the forensics sampler did not cover.
+
+    run_shot_forensics() analyses at most 32 (short) / 24 (long) shots;
+    this covers the rest with the same burst + the same pure classifier,
+    so every shot in the video gets a camera_motion value. Returns
+    {shot_id: {"camera_motion": str, "camera_motion_confidence": float}}.
+    A decode failure for a shot leaves it out (callers default it to
+    "unknown"). Never touches any scoring behaviour.
+    """
+    out: dict[int, dict[str, Any]] = {}
+    for s in shots:
+        frames = _decode_burst_rgb(video_path, s["start"], s["duration"])
+        if len(frames) == 0:
+            continue
+        lumas = 0.299 * frames[..., 0] + 0.587 * frames[..., 1] + 0.114 * frames[..., 2]
+        label, conf = _camera_motion_from_burst(lumas)
+        out[int(s["id"])] = {"camera_motion": label, "camera_motion_confidence": conf}
+    return out
 
 
 def _planar_motion_coherence(f1: np.ndarray, f2: np.ndarray) -> tuple[float, float]:
@@ -292,9 +512,6 @@ def run_shot_forensics(
         target_shots = [shots[i] for i in sorted(set(idx))]
 
     per_shot: list[dict[str, Any]] = []
-    weighted_totals: dict[str, float] = {k: 0.0 for k in CATEGORIES}
-    total_dur = 0.0
-    conf_sum = 0.0
 
     for s in target_shots:
         frames = _decode_burst_rgb(video_path, s["start"], s["duration"])
@@ -340,6 +557,12 @@ def run_shot_forensics(
         dup_ratio = float(dup_count / max(1, len(diffs)))
         planar_coh = float(np.mean(coherences)) if coherences else 0.0
 
+        # v2.0.4 item 4: camera motion from the same burst (static / pan /
+        # unknown — see _camera_motion_from_burst). Labelling only: it
+        # reads no scoring input and changes no score, probability or
+        # verdict — it is carried as an extra per-shot field.
+        cam_label, cam_conf = _camera_motion_from_burst(lumas)
+
         metrics = {
             "sensor_noise": round(noise, 2),
             "flat_region_ratio": round(flat_ratio, 3),
@@ -354,12 +577,6 @@ def run_shot_forensics(
         probs, top_label, conf, evidence = _score_shot_metrics(metrics, probe)
         needs_review = conf < 0.65
 
-        dur = max(0.1, float(s["duration"]))
-        for k, p_val in probs.items():
-            weighted_totals[k] += p_val * dur
-        total_dur += dur
-        conf_sum += conf * dur
-
         per_shot.append({
             "shot_id": s["id"],
             "start": s["start"],
@@ -368,32 +585,22 @@ def run_shot_forensics(
             "predicted_type": top_label,
             "confidence": conf,
             "needs_visual_review": needs_review,
+            "camera_motion": cam_label,
+            "camera_motion_confidence": cam_conf,
             "probs": probs,
             "palette_hex": _dominant_palette(mid_rgb, k=3),
             "metrics": metrics,
             "evidence": evidence,
         })
 
-    # Duration-weighted top-class production breakdown (sums cleanly to 100%)
-    if total_dur > 0:
-        winner_dur: dict[str, float] = {}
-        for ps in per_shot:
-            lbl = ps["predicted_type"]
-            winner_dur[lbl] = winner_dur.get(lbl, 0.0) + max(0.1, float(ps["duration"]))
-        breakdown_pct = {
-            k: round((v / total_dur) * 100.0, 1)
-            for k, v in sorted(winner_dur.items(), key=lambda kv: -kv[1])
-        }
-        overall_conf = round(conf_sum / total_dur, 2)
-        # Duration-weighted overall class probabilities (for the runner-up in
-        # the low-confidence verdict — measured, not guessed).
-        overall_probs = {
-            k: round(float(v / total_dur), 3) for k, v in weighted_totals.items()
-        }
-    else:
-        breakdown_pct = {}
-        overall_conf = 0.0
-        overall_probs = {k: 0.0 for k in CATEGORIES}
+    # v2.0.4: duration-weighted MEAN-SOFTMAX mix (see aggregate_mix) — the
+    # full per-shot distributions, not winner-take-all. "unknown" per-shot
+    # calls stay visible on the per-shot cards; they no longer swallow the
+    # whole mix as a fake production method.
+    mix = aggregate_mix(per_shot)
+    breakdown_pct = mix["duration_weighted_pct"]
+    overall_conf = mix["overall_confidence"]
+    overall_probs = mix["overall_probs"]
 
     primary_type = next(iter(breakdown_pct.keys()), "unknown")
     verdict_line, verdict_uncertain, runner_up = honest_verdict_summary(
@@ -438,13 +645,9 @@ def fuse_review_probabilities(
 
     fused_shots = []
     conflicts = []
-    weighted: dict[str, float] = {k: 0.0 for k in CATEGORIES}
-    total_dur = 0.0
-    conf_sum = 0.0
 
     for sf in forensics.get("per_shot", []):
         sid = sf["shot_id"]
-        dur = max(0.1, float(sf["duration"]))
         tool_probs = dict(sf["probs"])
         ann = annotations.get(sid)
 
@@ -476,11 +679,6 @@ def fuse_review_probabilities(
             final_lbl = sf["predicted_type"]
             final_conf = sf["confidence"]
 
-        for k, pv in fused.items():
-            weighted[k] += pv * dur
-        total_dur += dur
-        conf_sum += final_conf * dur
-
         fused_shots.append({
             **sf,
             "fused_type": final_lbl,
@@ -488,20 +686,20 @@ def fuse_review_probabilities(
             "fused_probs": fused,
         })
 
-    winner_dur: dict[str, float] = {}
-    for fs in fused_shots:
-        lbl = fs["fused_type"]
-        winner_dur[lbl] = winner_dur.get(lbl, 0.0) + max(0.1, float(fs["duration"]))
-    breakdown_pct = {
-        k: round((v / total_dur) * 100.0, 1)
-        for k, v in sorted(winner_dur.items(), key=lambda kv: -kv[1])
-    } if total_dur > 0 else {}
-    overall_conf = round(conf_sum / total_dur, 2) if total_dur > 0 else 0.0
-    # Duration-weighted overall class probabilities (runner-up source).
-    overall_probs = (
-        {k: round(float(v / total_dur), 3) for k, v in weighted.items()}
-        if total_dur > 0 else {k: 0.0 for k in CATEGORIES}
-    )
+    # v2.0.4: same mean-softmax mix as run_shot_forensics (aggregate_mix) —
+    # analyze and apply-review must not diverge. Entries use the FUSED
+    # distribution + fused confidence per shot.
+    mix = aggregate_mix([
+        {
+            "duration": fs["duration"],
+            "probs": fs["fused_probs"],
+            "confidence": fs["fused_confidence"],
+        }
+        for fs in fused_shots
+    ])
+    breakdown_pct = mix["duration_weighted_pct"]
+    overall_conf = mix["overall_confidence"]
+    overall_probs = mix["overall_probs"]
     summary, verdict_uncertain, runner_up = honest_verdict_summary(
         breakdown_pct, overall_probs, overall_conf
     )
