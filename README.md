@@ -15,19 +15,16 @@ Zero heavy native dependencies — runs smoothly on **Termux (Android), Linux, m
 
 ---
 
-## Why VideoDNA?
+## Why VideoDNA v2.0?
 
-Traditional video breakdown tools only give you a passive forensic report (*"this shot is AI, that shot is live"*).
-**VideoDNA** pairs a **free, exact X-Ray Engine** (Python + `ffmpeg`) with your **AI Agent as the Brain** (`SKILL.md`) to uncover:
+**VideoDNA v2.0** fuses **offline mathematical shot-level production forensics** with **Viral Retention X-Ray & Beat-The-Original strategy** — zero heavy native dependencies, runs smoothly on Termux, Linux, macOS, Windows, and Kaggle GPU:
 
-1. **Full Production Forensics ("Naari-Bhuri"):** Shot-by-shot cuts, pacing velocity, motion energy, color palette + auto-generated **3D `.cube` LUT**, audio loudness (`LUFS`), dead-air silences, beat/SFX transients, cut-to-beat sync ratio, and metadata/cadence clues.
-2. **Dual-Brain Short & Long Mode:**
-   - **Short-Form Mode (≤ 3 min):** Microscope audit — 0–5s Hook Strip (every 0.5s), hyper-cut detection, pattern-interrupt cadence, loop check.
-   - **Long-Form Mode (> 3 min):** Hierarchical Macro Acts + Critical Intro spotlight + Dead-Zone drop-off detector (so even a 60-minute video stays crystal-clear in minimal AI tokens).
-3. **Audience Comment Mining (URL Mode):** Automatically pulls Top 50–100 viewer comments (`yt-dlp`) and separates **Complaints, Unanswered Questions, Part-2 Requests, and Timestamp Callouts** — giving you real viewer proof of what the original missed!
-4. **🚀 Beat-The-Original 10x Upgrade Blueprint:** Diagnoses exact drop-off weaknesses and outputs **3 stronger hook variations**, timestamped pacing surgery, visual/audio upgrades, and remake routing (Google Flow / Veo, HyperFrames / Remotion, Cartesia voice, optional Kaggle GPU upscale).
-5. **🧬 Style Vault, Channel Pattern Cracker & Hybrid DNA Fusion:** Save winning videos to your vault, compare multiple videos to extract shared niche formulas (`videodna vault compare`), or fuse Hook A + Pacing B + Audio C (`videodna vault fuse`).
-6. **🔥 Hybrid Termux + Kaggle GPU Support:** Runs instantaneously on phone/PC in Lite Mode, and ships with `kaggle/videodna_deep_gpu.py` for GPU-accelerated **Demucs v4** (vocal/BGM separation) + **Faster-Whisper** (word-level Bengali/English/multilingual transcription).
+1. **Mathematical Shot-Level Production Forensics (Offline, Free):** Measures **sensor noise residual, flat-region ratio, color entropy, rectilinear UI edges, effective frame cadence, and 2D FFT planar motion coherence** per shot to classify **`live` / `ai_video` / `3d_render` / `code_motion` / `screen_rec` / `static_zoom`** with calibrated **Confidence %** BEFORE visual review!
+2. **Two-Pass Shot & Transition Detector (`scdet` + `frame_diff`):** Catches BOTH frame-accurate hard cuts AND smooth wipes/fades/slides (4/4 verified ground-truth accuracy on motion-graphics templates).
+3. **Smart Audio Forensics & BPM Estimator:** Accurately separates **Silent/Mute Tracks** (excluded from audio penalties — zero false alarms!), **Speech-only**, **Music-only**, and **Speech + BGM**, measures **LUFS**, estimates **BPM**, scores **Cut-to-Beat Sync**, and supports local `--transcribe` via Faster-Whisper.
+4. **Bayesian Evidence Fusion (`apply-review`):** Merges deterministic tool probabilities with AI Agent visual inspection and flags tool-vs-eye conflicts automatically.
+5. **Model-Aware Remake Batch Planner (`dna/remake_plan.md`):** Batches shots into minimal production units across **Google Flow (Veo), Kling, Seedance, MiniMax, HyperFrames/Remotion, and Live Shoot** + exports **SRT captions** and a **3D `.cube` Color LUT**.
+6. **Dual-Brain Short & Long Mode + Audience Comment Mining + Beat-The-Original Blueprint + Style Vault (`compare` & `fuse`) + Highlight `moments` zoomer!**
 
 ---
 

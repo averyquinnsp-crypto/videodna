@@ -177,15 +177,20 @@ def detect_shots(
         dur = round(max(0.0, end - start), 3)
         if dur < 0.05:
             continue
+        cut_src = (
+            "start" if i == 0
+            else ("scdet" if boundaries[i] in scdet_times else "frame_diff")
+        )
         shots.append({
             "id": len(shots) + 1,
             "start": start,
             "end": end,
             "duration": dur,
             "cut_score_in": round(scores_map.get(boundaries[i], 0.0), 2),
-            "cut_source_in": (
-                "start" if i == 0
-                else ("scdet" if boundaries[i] in scdet_times else "frame_diff")
+            "cut_source_in": cut_src,
+            "transition_in": (
+                "opening" if cut_src == "start"
+                else ("hard_cut" if cut_src == "scdet" else "soft_transition")
             ),
         })
 
@@ -197,6 +202,7 @@ def detect_shots(
             "duration": round(duration, 3),
             "cut_score_in": 0.0,
             "cut_source_in": "start",
+            "transition_in": "opening",
         }]
 
     durations = [s["duration"] for s in shots]
@@ -260,6 +266,8 @@ def detect_shots(
         },
         "shot_count": len(shots),
         "total_cuts": total_cuts,
+        "hard_cuts": scdet_cut_count,
+        "soft_transitions": diff_cut_count,
         "avg_shot_length_sec": asl,
         "shortest_shot_sec": round(min(durations), 2),
         "longest_shot_sec": round(max(durations), 2),

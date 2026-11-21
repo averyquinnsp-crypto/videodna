@@ -1,4 +1,4 @@
-"""VideoDNA CLI — 10x Video Reverse-Engineering & Beat-The-Original Engine."""
+"""VideoDNA v2.0 CLI — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine."""
 
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from typing import Any
 from videodna import __version__
 from videodna.audio import analyze_audio
 from videodna.diagnostics import compute_diagnostics
+from videodna.forensics import fuse_review_probabilities, run_shot_forensics
 from videodna.ingest import find_yt_dlp, ingest_url, is_url, parse_subtitle_file, transcribe_local
 from videodna.probe import probe_video
+from videodna.remake import build_remake_plan
 from videodna.report import write_outputs
 from videodna.shots import detect_shots
 from videodna.vault import crack_channel_patterns, fuse_dna, list_vault, save_to_vault
@@ -37,7 +39,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     if is_url(source):
         out_dir = Path(args.output) if args.output else Path("out") / _safe_slug(source.split("/")[-1])
         out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[VideoDNA] Downloading URL + metadata + comments via yt-dlp...")
+        print("[VideoDNA] Downloading URL + metadata + comments via yt-dlp...")
         ing = ingest_url(source, out_dir, max_comments=args.max_comments, sub_langs=args.sub_langs)
         video_path = ing["video_path"]
         platform_meta = ing["platform_meta"]
@@ -56,41 +58,48 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             if t_path.exists():
                 transcript = parse_subtitle_file(t_path)
 
-    print(f"[VideoDNA] 1/4 Probing technical metadata & AIGC forensics...")
+    print("[VideoDNA] 1/5 Probing container metadata & cadence forensics...")
     probe = probe_video(video_path)
     mode = probe["recommended_mode"] if args.mode == "auto" else args.mode
 
-    print(f"[VideoDNA] 2/4 Detecting shots & pacing (mode={mode}, duration={probe['duration_sec']}s)...")
+    print(f"[VideoDNA] 2/5 Running two-pass shot detector (mode={mode}, duration={probe['duration_sec']}s)...")
     shots = detect_shots(
         video_path, probe["duration_sec"], mode=mode, threshold=args.threshold,
         width=probe["width"], height=probe["height"],
     )
 
-    print(f"[VideoDNA] 3/4 Extracting keyframes, motion energy, color DNA & 3D .cube LUT...")
+    print("[VideoDNA] 3/5 Running mathematical per-shot production forensics (noise, flatness, cadence, 2D coherence)...")
+    forensics = run_shot_forensics(video_path, probe, shots, mode=mode)
+
+    print("[VideoDNA] 4/5 Extracting keyframes, motion energy, color DNA & 3D .cube LUT...")
     visual = analyze_visuals(video_path, shots, out_dir, mode=mode)
 
-    print(f"[VideoDNA] 4/4 Analyzing audio loudness (LUFS), dead-air, beat/SFX transients...")
+    print("[VideoDNA] 5/5 Running smart audio forensics (silence/speech/music classifier, LUFS, BPM, cut-sync)...")
     audio = analyze_audio(video_path, probe["duration_sec"], shots["shots"], out_dir, has_audio=probe["has_audio"])
 
-    if args.transcribe and probe["has_audio"] and not transcript:
+    if args.transcribe and probe["has_audio"] and not audio.get("is_silent_track") and not transcript:
         transcript = transcribe_local(video_path, model=args.transcribe_model)
 
-    diagnostics = compute_diagnostics(probe, shots, visual, audio, comments_intel=comments_intel)
-    # Use the motion-aware dead-zone list everywhere (shots.md, CLI summary)
-    # so a high-motion long shot is never reported as dead.
+    diagnostics = compute_diagnostics(
+        probe, shots, visual, audio, comments_intel=comments_intel, forensics=forensics
+    )
     shots["dead_zones"] = diagnostics["effective_dead_zones"]
+    remake_plan = build_remake_plan(forensics, audio, visual["color_dna"])
 
     blueprint: dict[str, Any] = {
-        "schema_version": "videodna/1.0",
+        "schema_version": "videodna/2.0",
         "probe": probe,
         "platform_meta": platform_meta,
         "thumbnail": thumbnail,
         "shots": shots,
+        "forensics": forensics,
+        "fused_forensics": None,
         "visual": visual,
         "audio": audio,
         "transcript": transcript,
         "comments_intel": comments_intel,
         "diagnostics": diagnostics,
+        "remake_plan": remake_plan,
         "agent_review": None,
     }
 
@@ -100,14 +109,21 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         v_path = save_to_vault(blueprint, name=args.vault_name)
         print(f"[VideoDNA] Saved DNA snapshot to Style Vault: {v_path}")
 
-    print("\n=== VideoDNA Analysis Complete ===")
-    print(f"Mode:            {mode.upper()} ({probe['duration_sec']}s, {probe['width']}x{probe['height']})")
-    print(f"Retention Score: {diagnostics['overall_retention_score']}/10")
-    print(f"Shots / ASL:     {shots['shot_count']} shots | Avg {shots['avg_shot_length_sec']}s | {shots['cuts_per_minute']} cuts/min")
-    print(f"Dead-Zones:      {len(shots['dead_zones'])}")
-    lufs_display = audio.get("integrated_lufs")
-    lufs_txt = f"{lufs_display} LUFS" if lufs_display is not None else "N/A (silent)"
-    print(f"Audio Loudness:  {lufs_txt} | Sync: {int(audio.get('cut_beat_sync_ratio', 0)*100)}%")
+    conf_pct = int(round(forensics["overall_confidence"] * 100))
+    audio_summary = (
+        "SILENT TRACK (no audible sound)"
+        if audio.get("is_silent_track")
+        else f"{audio.get('audio_type')} | {audio.get('integrated_lufs')} LUFS"
+        + (f" | ~{audio['estimated_bpm']} BPM" if audio.get("estimated_bpm") else "")
+    )
+
+    print("\n=== VideoDNA v2.0 Analysis Complete ===")
+    print(f"How It Was Made: {forensics['verdict_summary']} (Confidence: {conf_pct}%)")
+    print(f"Mode / Size:     {mode.upper()} ({probe['duration_sec']}s, {probe['width']}x{probe['height']})")
+    print(f"Shots Detected:  {shots['shot_count']} ({shots.get('hard_cuts', 0)} hard cuts + {shots.get('soft_transitions', 0)} soft transitions) | ASL {shots['avg_shot_length_sec']}s")
+    print(f"Retention Score: {diagnostics['overall_retention_score']}/10 (heuristic) | Dead-Zones: {len(shots['dead_zones'])}")
+    print(f"Audio Status:    {audio_summary}")
+    print(f"Remake Batches:  {remake_plan['total_batches']} batch(es)")
     print(f"DNA Brief (AI):  {paths['dna_md']}")
     print(f"HTML Dashboard:  {paths['report_html']}")
     print(f"Review Template: {paths['agent_review_template']}")
@@ -125,14 +141,66 @@ def cmd_apply_review(args: argparse.Namespace) -> int:
     blueprint = json.loads(bp_path.read_text(encoding="utf-8"))
     review = json.loads(rev_path.read_text(encoding="utf-8"))
     blueprint["agent_review"] = review
-    paths = write_outputs(out_dir, blueprint)
 
+    if blueprint.get("forensics"):
+        fused = fuse_review_probabilities(blueprint["forensics"], review)
+        blueprint["fused_forensics"] = fused
+        blueprint["remake_plan"] = build_remake_plan(
+            blueprint["forensics"], blueprint["audio"], blueprint["visual"]["color_dna"], fused=fused
+        )
+        print(
+            f"[VideoDNA] Fused Verdict: {fused['verdict_summary']} "
+            f"(Confidence: {int(round(fused['overall_confidence']*100))}% | Conflicts: {len(fused['conflicts'])})"
+        )
+
+    paths = write_outputs(out_dir, blueprint)
     if args.save_vault:
         save_to_vault(blueprint)
 
-    print(f"[VideoDNA] Merged AI Brain review into:")
+    print("[VideoDNA] Merged AI Brain review into:")
     print(f"  - {paths['dna_md']}")
     print(f"  - {paths['report_html']}")
+    return 0
+
+
+def cmd_moments(args: argparse.Namespace) -> int:
+    """Extract 6fps zoomed frame strips around top transitions/highlights/tricks."""
+    out_dir = Path(args.dir).expanduser().resolve()
+    bp_path = out_dir / "blueprint.json"
+    if not bp_path.exists():
+        print(f"[Error] blueprint.json not found in {out_dir}", file=sys.stderr)
+        return 1
+    bp = json.loads(bp_path.read_text(encoding="utf-8"))
+    video_path = Path(bp["probe"]["file"])
+    duration = bp["probe"]["duration_sec"]
+
+    peaks: list[tuple[float, str]] = []
+    for s in bp["shots"]["shots"][1:]:
+        peaks.append((s["start"], f"{s.get('transition_in', 'cut')}_shot_{s['id']}"))
+    for tr in (bp["audio"].get("audio_transients") or [])[:5]:
+        if all(abs(tr["t"] - pt) > 1.2 for pt, _ in peaks):
+            peaks.append((tr["t"], f"audio_peak_{tr['jump_db']}dB"))
+
+    peaks = sorted(peaks, key=lambda x: x[0])[: args.limit]
+    m_dir = out_dir / "moments"
+    m_dir.mkdir(parents=True, exist_ok=True)
+    generated = []
+    for idx, (t, label) in enumerate(peaks, start=1):
+        s_t = max(0.0, t - 0.8)
+        e_t = min(duration, t + 1.0)
+        out_jpg = m_dir / f"moment_{idx:02d}_{label}.jpg"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{s_t:.2f}", "-to", f"{e_t:.2f}",
+            "-i", str(video_path),
+            "-vf", "scale=320:-2,fps=6,tile=4x3",
+            "-frames:v", "1", "-q:v", "2", "-y", str(out_jpg),
+        ]
+        res = subprocess.run(cmd, capture_output=True)
+        if res.returncode == 0 and out_jpg.exists():
+            generated.append({"t": t, "label": label, "sheet": str(out_jpg)})
+
+    print(json.dumps({"moments_extracted": len(generated), "moments": generated}, indent=2))
     return 0
 
 
@@ -209,7 +277,7 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="videodna",
-        description="VideoDNA — 10x Video Reverse-Engineering, Viral X-Ray & Beat-The-Original Engine.",
+        description="VideoDNA v2.0 — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine.",
     )
     p.add_argument("--version", action="version", version=f"videodna {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
@@ -220,19 +288,24 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--mode", choices=["auto", "short", "long"], default="auto", help="Analysis mode.")
     pa.add_argument("--threshold", type=float, default=None, help="Override ffmpeg scdet cut threshold.")
     pa.add_argument("--transcript", help="Optional local .srt/.vtt subtitle file.")
-    pa.add_argument("--transcribe", action="store_true", help="Transcribe speech locally with Faster-Whisper (optional extra: pip install 'videodna[transcribe]'). Skipped when a transcript already exists.")
-    pa.add_argument("--transcribe-model", default="base", help="Faster-Whisper model: tiny/base/small/medium/large-v3 (default: base).")
+    pa.add_argument("--transcribe", action="store_true", help="Transcribe speech locally with Faster-Whisper.")
+    pa.add_argument("--transcribe-model", default="base", help="Faster-Whisper model (default: base).")
     pa.add_argument("--max-comments", type=int, default=80, help="Max audience comments to mine on URL input.")
     pa.add_argument("--sub-langs", default="en,bn,hi", help="Subtitle languages for yt-dlp.")
     pa.add_argument("--save-vault", action="store_true", help="Save DNA snapshot into Style Vault.")
     pa.add_argument("--vault-name", help="Custom name for Style Vault entry.")
     pa.set_defaults(func=cmd_analyze)
 
-    pr = sub.add_parser("apply-review", help="Merge AI Agent visual review & Beat-The-Original plan into DNA.md & report.html.")
+    pr = sub.add_parser("apply-review", help="Fuse AI Agent visual review & Beat-The-Original plan into DNA.md & report.html.")
     pr.add_argument("dir", help="Output folder generated by `videodna analyze`.")
     pr.add_argument("--review-file", help="Custom JSON review path (default: <dir>/agent_review.json).")
     pr.add_argument("--save-vault", action="store_true", help="Update Style Vault with reviewed DNA.")
     pr.set_defaults(func=cmd_apply_review)
+
+    pm = sub.add_parser("moments", help="Extract 6fps zoomed frame strips around top transitions/highlights/tricks.")
+    pm.add_argument("dir", help="Output folder generated by `videodna analyze`.")
+    pm.add_argument("--limit", type=int, default=5, help="Max peak moments to extract.")
+    pm.set_defaults(func=cmd_moments)
 
     pf = sub.add_parser("frames", help="Extract dense zoomed frame grid between two timestamps.")
     pf.add_argument("video", help="Path to video file.")

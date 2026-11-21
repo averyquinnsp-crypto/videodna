@@ -67,6 +67,8 @@ def _classify_color_grade(mean_rgb: np.ndarray, contrast: float, saturation: flo
     luma = 0.299 * r + 0.587 * g + 0.114 * b
     if saturation < 0.08:
         return "monochrome_or_noir"
+    if contrast >= 0.30 and saturation < 0.28:
+        return "high_contrast_noir_graphic"
     if luma < 0.28 and contrast > 0.22:
         return "dark_moody_cinematic"
     if luma > 0.70 and saturation < 0.28:

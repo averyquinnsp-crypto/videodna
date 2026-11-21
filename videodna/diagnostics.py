@@ -11,6 +11,7 @@ def compute_diagnostics(
     visual: dict[str, Any],
     audio: dict[str, Any],
     comments_intel: dict[str, Any] | None = None,
+    forensics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Score retention signals and flag concrete opportunities to beat the reference video.
 
@@ -188,6 +189,9 @@ def compute_diagnostics(
         ),
         "audio_excluded_from_score": audio_excluded,
         "effective_dead_zones": effective_dead_zones,
+        "true_dead_zones": effective_dead_zones,
+        "production_verdict_auto": (forensics or {}).get("verdict_summary", "unknown"),
+        "production_confidence_auto": (forensics or {}).get("overall_confidence", 0.0),
         "notes": notes,
         "scores": {
             "hook_velocity": round(hook_score, 1),

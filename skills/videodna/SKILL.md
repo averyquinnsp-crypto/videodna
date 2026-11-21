@@ -34,17 +34,20 @@ videodna analyze "<video_path_or_url>" -o out/<slug> --save-vault
 
 ### Step 2 — Read Layered Outputs (NEVER dump raw huge JSON)
 Read strictly in this order to stay razor-sharp and save tokens:
-1. Read `out/<slug>/DNA.md` — gives you full telemetry, mode, retention score, pacing map, loudness, color DNA, dead-zones, and auto-detected weaknesses.
-2. **Visually inspect these 3 images directly** (you are the Vision Brain!):
+1. Read `out/<slug>/DNA.md` — gives you **Mathematical Shot-Level Production Forensics** (`live / ai_video / 3d_render / code_motion / screen_rec / static_zoom` + calibrated Confidence % + sensor noise, flat%, 2D coherence), **Model-Aware Remake Batches**, retention heuristics, pacing map, smart audio status (`silent / speech / music / BPM`), color DNA, and weaknesses.
+2. **Visually inspect these 3 images directly** (you are the Vision Brain — prioritize any `Low-Confidence Shots` flagged in `DNA.md`!):
    - `out/<slug>/hook_strip.jpg` (Opening 0–5s for Shorts / 0–12s for Long-form — inspect FIRST!)
    - `out/<slug>/storyboard.jpg` (Key shots with timestamps & motion classes)
-   - `out/<slug>/audio_timeline.png` (Energy curve, red Dead-Air bars, yellow visual cuts)
+   - `out/<slug>/audio_timeline.png` (Energy curve or silent-track indicator + yellow visual cut ticks)
 3. Read on demand:
+   - `out/<slug>/dna/remake_plan.md` (batched generation units across Flow/Veo, Kling, HyperFrames, Live Shoot)
    - `out/<slug>/dna/comments.md` (CRITICAL when URL was analyzed — reveals real viewer pain points, confusion, and Part-2 demand!)
-   - `out/<slug>/dna/transcript.md` (spoken script & hook wording)
-   - `out/<slug>/dna/shots.md` (exact shot boundaries & dead-zones)
-4. If any transition, trick, or shot is unclear, zoom into it at 0.2s precision:
+   - `out/<slug>/dna/transcript.md` (+ exported `dna/captions.srt`)
+   - `out/<slug>/dna/shots.md` (exact two-pass shot boundaries, transition types, forensic metrics & dead-zones)
+4. For trick reveals, rapid transitions, or climaxes, run:
    ```bash
+   videodna moments out/<slug> --limit 5
+   # Or zoom manually at 0.2s precision:
    videodna frames "<video>" --start 2.0 --end 4.4 --every 0.2 -o out/<slug>/zoom_check.jpg
    ```
 

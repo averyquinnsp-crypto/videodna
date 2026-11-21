@@ -1,0 +1,100 @@
+"""Model-aware remake batch planner (groups shots into minimal generation/production units)."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+MODEL_CAPABILITIES: dict[str, dict[str, Any]] = {
+    "code_motion": {
+        "recommended_tool": "HyperFrames (HTML/CSS/GSAP) or Remotion",
+        "max_batch_sec": 60.0,
+        "cost_tier": "free_local",
+        "strategy": "Combine consecutive motion-graphics / text / template shots into a single unified timeline composition.",
+    },
+    "ai_video": {
+        "recommended_tool": "Google Flow (Veo 3) / Kling 2.1 / Seedance / MiniMax",
+        "max_batch_sec": 8.0,
+        "cost_tier": "ai_credits",
+        "strategy": "Batch consecutive AI shots sharing the same scene/palette up to 8s per generation clip using 1 consistent reference image.",
+    },
+    "3d_render": {
+        "recommended_tool": "Blender / Three.js (HyperFrames WebGL) OR Veo/Kling I2V",
+        "max_batch_sec": 10.0,
+        "cost_tier": "free_or_ai",
+        "strategy": "Render clean 3D explainers/products in Blender/Three.js for 100% consistency, or batch stylized 3D shots into 8–10s I2V clips.",
+    },
+    "live": {
+        "recommended_tool": "Live Camera / Phone Rig Shoot",
+        "max_batch_sec": 120.0,
+        "cost_tier": "real_shoot",
+        "strategy": "Film consecutive live shots in 1 continuous setup & lighting rig, then punch-cut in editing.",
+    },
+    "screen_rec": {
+        "recommended_tool": "Fresh Screen Recording (OBS / Phone Capture)",
+        "max_batch_sec": 120.0,
+        "cost_tier": "free_local",
+        "strategy": "Record clean original UI/screen footage directly; overlay zoom & highlights in post.",
+    },
+    "static_zoom": {
+        "recommended_tool": "ImageGen + HyperFrames / FFmpeg Ken Burns",
+        "max_batch_sec": 30.0,
+        "cost_tier": "free_local",
+        "strategy": "Generate high-res still images once, then animate smooth scale/pan/parallax curves in code.",
+    },
+}
+
+
+def build_remake_plan(
+    forensics: dict[str, Any],
+    audio: dict[str, Any],
+    color_dna: dict[str, Any],
+    fused: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Group consecutive same-type shots into minimal production batches."""
+    shot_list = (fused or forensics).get("per_shot", [])
+    batches: list[dict[str, Any]] = []
+
+    for sf in shot_list:
+        stype = sf.get("fused_type") or sf.get("predicted_type") or "code_motion"
+        cap = MODEL_CAPABILITIES.get(stype, MODEL_CAPABILITIES["code_motion"])
+        max_dur = float(cap["max_batch_sec"])
+        dur = float(sf["duration"])
+
+        if (
+            batches
+            and batches[-1]["production_type"] == stype
+            and (batches[-1]["total_duration"] + dur) <= max_dur
+        ):
+            b = batches[-1]
+            b["shot_ids"].append(sf["shot_id"])
+            b["end"] = sf["end"]
+            b["total_duration"] = round(b["total_duration"] + dur, 2)
+        else:
+            batches.append({
+                "batch_id": len(batches) + 1,
+                "production_type": stype,
+                "tool": cap["recommended_tool"],
+                "cost_tier": cap["cost_tier"],
+                "shot_ids": [sf["shot_id"]],
+                "start": sf["start"],
+                "end": sf["end"],
+                "total_duration": round(dur, 2),
+                "strategy": cap["strategy"],
+            })
+
+    # Audio & Finish routing
+    audio_type = audio.get("audio_type", "unknown")
+    if audio_type == "silent_no_audio":
+        audio_plan = "Original track is SILENT — add fresh studio voiceover + dark/matching BGM + beat-synced SFX mastered to -14 LUFS via voice-pro."
+    elif audio_type == "music_only":
+        audio_plan = f"Music-driven edit (est. {audio.get('estimated_bpm') or 'N/A'} BPM) — source/generate copyright-safe track matching BPM and align cuts to beats."
+    else:
+        audio_plan = f"Voice + BGM pipeline — record/clone narration and master via voice-pro (-14 LUFS, tight compression, -12dB BGM ducking)."
+
+    return {
+        "total_batches": len(batches),
+        "batches": batches,
+        "audio_pipeline": audio_plan,
+        "color_pipeline": f"Apply auto-generated LUT `{color_dna.get('lut_file')}` ({color_dna.get('grade_style')}) + final 2K polish via Kaggle GPU Upscaler.",
+    }
