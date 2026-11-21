@@ -1,4 +1,4 @@
-"""Layered AI-Native DNA.md, blueprint.json, sub-docs (shots, remake_plan, SRT, comments), and report.html (v2.0.1)."""
+"""Layered AI-Native DNA.md, blueprint.json, sub-docs (shots, remake_plan, SRT, comments), and report.html (v2.0.2)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from videodna.remake import OCR_TEXT_STATUS
+
 
 def _sec_to_srt_time(sec: float) -> str:
     ms = int(round(max(0.0, sec) * 1000))
@@ -14,6 +16,80 @@ def _sec_to_srt_time(sec: float) -> str:
     mins, rem = divmod(rem, 60000)
     secs, millis = divmod(rem, 1000)
     return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
+
+
+def _build_shot_cards(bp: dict[str, Any]) -> list[dict[str, Any]]:
+    """Merge shots + forensics + visual measurements into per-shot cards.
+
+    Every field is measured by the pipeline (shot detector, forensics burst,
+    visual keyframes) — nothing is described or invented. On-screen text is
+    only ever text an OCR engine actually extracted; with no OCR installed
+    (see remake.OCR_TEXT_STATUS) every card states that plainly.
+    """
+    f_src = bp.get("fused_forensics") or bp.get("forensics") or {}
+    f_map = {x["shot_id"]: x for x in f_src.get("per_shot", [])}
+    vis_map = {v["shot_id"]: v for v in (bp.get("visual") or {}).get("shot_visuals", [])}
+    rm_cards = {c["shot_id"]: c for c in (bp.get("remake_plan") or {}).get("shot_cards", [])}
+    cards: list[dict[str, Any]] = []
+    for s in (bp.get("shots") or {}).get("shots", []):
+        sid = s["id"]
+        fx = f_map.get(sid, {})
+        v = vis_map.get(sid, {})
+        rc = rm_cards.get(sid, {})
+        m = fx.get("metrics") or {}
+        conf = fx.get("fused_confidence") or fx.get("confidence")
+        cards.append({
+            "shot_id": sid,
+            "start": s["start"],
+            "end": s["end"],
+            "duration": s["duration"],
+            "transition_in": s.get("transition_in", "-"),
+            "production_type": fx.get("fused_type") or fx.get("predicted_type") or "-",
+            "production_confidence": conf,
+            "palette_hex": list(fx.get("palette_hex") or rc.get("palette_hex") or []),
+            "motion_class": v.get("motion_class", "-"),
+            "motion_energy": v.get("motion_energy"),
+            "motion_energy_units": "mean abs pixel diff, 0-255 scale, start→mid→end keyframes",
+            "mean_frame_diff": m.get("mean_frame_diff"),
+            "mean_frame_diff_units": rc.get("motion_units")
+            or "mean abs luma diff per pixel, 0-255 scale, across the burst frames inside the shot",
+            "on_screen_text": OCR_TEXT_STATUS,
+        })
+    return cards
+
+
+def _render_shot_card(card: dict[str, Any], heading: str) -> list[str]:
+    """Render one measured shot card as markdown lines."""
+    conf = card.get("production_confidence")
+    conf_txt = f" ({int(round(float(conf) * 100))}% confidence)" if conf is not None else ""
+    palette = card.get("palette_hex") or []
+    palette_txt = (
+        ", ".join(f"`{h}`" for h in palette)
+        if palette else "not measured (no palette extracted for this shot)"
+    )
+    motion_bits = []
+    if card.get("motion_class") not in (None, "-"):
+        motion_bits.append(f"`{card['motion_class']}`")
+    if card.get("motion_energy") is not None:
+        motion_bits.append(
+            f"motion energy {card['motion_energy']} ({card.get('motion_energy_units', '')})"
+        )
+    if card.get("mean_frame_diff") is not None:
+        motion_bits.append(
+            f"mean frame diff inside shot {card['mean_frame_diff']} "
+            f"({card.get('mean_frame_diff_units', '')})"
+        )
+    motion_txt = " — ".join(motion_bits) if motion_bits else "not measured"
+    return [
+        heading,
+        f"- **Window:** {card['start']:.2f}–{card['end']:.2f}s ({card['duration']:.2f}s)",
+        f"- **Transition in:** `{card.get('transition_in', '-')}`",
+        f"- **Production call:** `{card.get('production_type', '-')}`{conf_txt}",
+        f"- **Dominant colors (measured, mid-shot frame):** {palette_txt}",
+        f"- **Motion:** {motion_txt}",
+        f"- **On-screen text:** {card.get('on_screen_text', OCR_TEXT_STATUS)}",
+        "",
+    ]
 
 
 def write_outputs(out_dir: Path, blueprint: dict[str, Any]) -> dict[str, str]:
@@ -135,7 +211,7 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
 
     audio_score_disp = "N/A (silent)" if d["scores"]["audio_dynamics"] is None else f"`{d['scores']['audio_dynamics']}`"
     lines = [
-        f"# VideoDNA v2.0.1 Report — `{p['filename']}`",
+        f"# VideoDNA v2.0.2 Report — `{p['filename']}`",
         "",
         "## 1. Executive Telemetry & Production Verdict",
         f"- **How It Was Made ({verdict_tag}):** **{verdict_str}** (Confidence: **{verdict_conf}%**)",
@@ -198,6 +274,7 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
             lines.append(f"| B{b['batch_id']} | {s_ids} | {b['start']:.1f}–{b['end']:.1f}s ({b['total_duration']}s) | `{b['production_type']}` | {b['tool']} |")
         lines.append(f"- **Audio Route:** {rm.get('audio_pipeline', '')}")
         lines.append(f"- **Color Route:** {rm.get('color_pipeline', '')}")
+        lines.append("- **Per-Shot Content Cards:** measured duration, transition, dominant colors, motion and on-screen text for every shot — see `dna/remake_plan.md` and `dna/shots.md` (no descriptions invented; on-screen text is listed only if OCR extracted it — none is installed).")
 
     lines += ["", f"## {sec}. Retention Audit & Beat-The-Original Signals"]
     sec += 1
@@ -260,8 +337,8 @@ def _render_dna_md(bp: dict[str, Any]) -> str:
         "| `storyboard.jpg` | Labeled keyframe contact sheet across all shots |",
         "| `audio_timeline.png` | Audio energy curve / silent indicator + yellow cut markers |",
         "| `reference_grade.cube` | Auto-generated 17×17×17 3D color LUT |",
-        "| `dna/shots.md` | Complete shot table + physical forensic metrics + dead-zones |",
-        "| `dna/remake_plan.md` | Model-aware batched remake strategy & tool routing |",
+        "| `dna/shots.md` | Complete shot table + physical forensic metrics + dead-zones + measured per-shot content cards |",
+        "| `dna/remake_plan.md` | Model-aware batched remake strategy & tool routing + per-shot content cards |",
         "| `dna/transcript.md` | Timestamped transcript (+ `dna/captions.srt` when present) |",
         "| `dna/comments.md` | Mined viewer complaints, questions, requests & timestamps |",
         "| `report.html` | Interactive offline dark-mode visual dashboard |",
@@ -299,11 +376,26 @@ def _render_shots_md(bp: dict[str, Any]) -> str:
             lines.append(
                 f"- **Shot #{dz['shot_id']} ({dz['start']}s–{dz['end']}s, {dz['duration']}s) [{dz['severity'].upper()}]:** {dz['reason']}"
             )
+    lines += [
+        "",
+        "## Shot Cards — Measured Per-Shot Content (no descriptions invented)",
+        "",
+        "Each card carries only pipeline-measured values: window/duration and",
+        "transition from the shot detector, dominant colors from the shot's",
+        "mid-frame pixels, motion from keyframe/burst frame differences, and",
+        "on-screen text ONLY if an OCR engine actually extracted it (none is",
+        "installed — see the per-card note). Use these cards, not the generic",
+        "batch strategy, to rebuild each shot.",
+        "",
+    ]
+    for card in _build_shot_cards(bp):
+        lines += _render_shot_card(card, f"### Shot #{card['shot_id']:02d}")
     return "\n".join(lines) + "\n"
 
 
 def _render_remake_md(bp: dict[str, Any]) -> str:
     rm = bp.get("remake_plan") or {}
+    cards = {c["shot_id"]: c for c in _build_shot_cards(bp)}
     lines = [
         "# Model-Aware Batched Remake Plan",
         "",
@@ -321,7 +413,16 @@ def _render_remake_md(bp: dict[str, Any]) -> str:
             f"- **Recommended Tool:** {b['tool']} (`{b['cost_tier']}`)",
             f"- **Strategy:** {b['strategy']}",
             "",
+            "#### Per-Shot Content Cards (measured — rebuild each shot from its own card)",
+            "",
         ]
+        for sid in b["shot_ids"]:
+            card = cards.get(sid)
+            if card is None:
+                lines.append(f"##### Shot #{sid:02d} — no measurements available")
+                lines.append("")
+                continue
+            lines += _render_shot_card(card, f"##### Shot #{sid:02d}")
     return "\n".join(lines) + "\n"
 
 
@@ -433,7 +534,7 @@ def _render_html_report(bp: dict[str, Any]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VideoDNA v2.0.1 — {title}</title>
+<title>VideoDNA v2.0.2 — {title}</title>
 <style>
   :root {{ --bg:#0b0f19; --card:#131a2a; --border:#23304d; --text:#e6edf8; --muted:#8fa3c7; --accent:#58a6ff; }}
   * {{ box-sizing:border-box; }}
@@ -467,7 +568,7 @@ def _render_html_report(bp: dict[str, Any]) -> str:
 <div class="wrap">
   <header>
     <div>
-      <span class="badge">VideoDNA v2.0.1 · {sh['mode'].upper()} MODE</span>
+      <span class="badge">VideoDNA v2.0.2 · {sh['mode'].upper()} MODE</span>
       <h1>{title}</h1>
     </div>
     <div>

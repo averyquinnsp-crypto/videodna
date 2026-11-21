@@ -1,4 +1,4 @@
-"""VideoDNA v2.0.1 CLI — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine."""
+"""VideoDNA v2.0.2 CLI — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine."""
 
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         + (f" | ~{audio['estimated_bpm']} BPM" if audio.get("estimated_bpm") else "")
     )
 
-    print("\n=== VideoDNA v2.0.1 Analysis Complete ===")
+    print("\n=== VideoDNA v2.0.2 Analysis Complete ===")
     print(f"How It Was Made: {forensics['verdict_summary']} (Confidence: {conf_pct}%)")
     print(f"Mode / Size:     {mode.upper()} ({probe['duration_sec']}s, {probe['width']}x{probe['height']})")
     print(f"Shots Detected:  {shots['shot_count']} ({shots.get('hard_cuts', 0)} hard cuts + {shots.get('soft_transitions', 0)} soft transitions) | ASL {shots['avg_shot_length_sec']}s")
@@ -265,7 +265,10 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         print(f"  - {tool:8s}: {status}")
     yt_dlp_cmd = find_yt_dlp()
     print(f"  - yt-dlp  : {'OK (' + ' '.join(yt_dlp_cmd) + ')' if yt_dlp_cmd else 'MISSING (optional for local MP4)'}")
-    for mod in ("numpy", "PIL", "requests"):
+    # Only check modules the CLI actually imports. `requests` is NOT checked:
+    # nothing in the code imports it (it is only an optional [ai] extra), so
+    # a fresh base install must not report it MISSING.
+    for mod in ("numpy", "PIL"):
         try:
             __import__(mod)
             print(f"  - {mod:8s}: OK")
@@ -277,7 +280,7 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="videodna",
-        description="VideoDNA v2.0.1 — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine.",
+        description="VideoDNA v2.0.2 — 10x Video Forensics, Viral X-Ray & Beat-The-Original Engine.",
     )
     p.add_argument("--version", action="version", version=f"videodna {__version__}")
     sub = p.add_subparsers(dest="command", required=True)

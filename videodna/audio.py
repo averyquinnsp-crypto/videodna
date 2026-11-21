@@ -61,7 +61,36 @@ def _estimate_bpm(samples: np.ndarray, sr: int) -> tuple[float | None, float]:
     if peak_val < 0.14:
         return None, round(peak_val, 2)
     lag = min_lag + best_idx
-    bpm = round(60.0 * env_fps / lag, 1)
+
+    # Octave-fold guard (v2.0.2): a periodic onset train autocorrelates
+    # at every multiple of the true period, and the window's max-lag edge
+    # (60 BPM) can out-score the fundamental — a 180 BPM click train
+    # peaks at lag 50 (3x period, ac 0.909) above lag 17 (true period,
+    # ac 0.775) and was read as 60.0 BPM. Check sub-multiples (lag/3,
+    # then lag/2) and prefer the smallest lag whose autocorrelation is
+    # comparably strong (>= 70% of the peak). True 60/120 BPM trains
+    # are safe: their sub-multiple lags score ~0 (click60: ac[17]=-0.02,
+    # ac[25]=-0.02; click120's sub-multiples fall below min_lag).
+    for divisor in (3, 2):
+        sub = int(round(lag / divisor))
+        if sub >= min_lag and float(ac[sub]) >= 0.70 * peak_val:
+            lag = sub
+            peak_val = float(ac[sub])
+            break
+
+    # Parabolic interpolation around the chosen lag: the true period
+    # usually falls between integer lags (180 BPM = 16.67 frames at
+    # 50 fps, so lag 17 alone reads 176.5). Verified on fixtures:
+    # click180 176.5 -> 178.7, click60/120 stay 60.0/120.0.
+    lag_f = float(lag)
+    if 0 < lag < len(ac) - 1:
+        a, b, c = float(ac[lag - 1]), float(ac[lag]), float(ac[lag + 1])
+        denom = a - 2.0 * b + c
+        if denom != 0.0:
+            delta = 0.5 * (a - c) / denom
+            if abs(delta) <= 1.0:
+                lag_f = lag + delta
+    bpm = round(60.0 * env_fps / lag_f, 1)
     return bpm, round(min(1.0, peak_val), 2)
 
 
@@ -121,7 +150,16 @@ def _classify_audio_content(
             return "speech_plus_bgm", feats
         return "music_only", feats
     if speech_e >= 0.48 and bpm_conf >= 0.15:
-        return "speech_plus_bgm", feats
+        # Voice-activity / pause-structure gate (v2.0.2): real speech
+        # pauses between syllables and phrases, so it shows low-energy
+        # frames or dead air. Continuous music has neither — U4 (music,
+        # no speech) measured pause ratio 0.005 and dead air 0.0 yet
+        # fired this branch (speech_e 0.572, bpm_conf 0.19) and was
+        # called speech_plus_bgm. Require some pause structure before
+        # calling a track speech; without it the track falls through to
+        # music_only / ambient_or_sfx below.
+        if low_energy_frac >= 0.05 or dead_air_ratio >= 0.02:
+            return "speech_plus_bgm", feats
     if bass_e >= 0.25:
         return "music_only", feats
     return "ambient_or_sfx", feats

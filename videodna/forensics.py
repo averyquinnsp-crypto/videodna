@@ -19,6 +19,64 @@ import numpy as np
 
 CATEGORIES = ("live", "ai_video", "3d_render", "code_motion", "screen_rec", "static_zoom")
 
+# v2.0.2: a production call is only asserted when the duration-weighted
+# overall confidence reaches this threshold. Below it the verdict must say
+# the call is uncertain (with the real runner-up) instead of asserting one
+# type — e.g. U4 (purple 3D character) read "code_motion 100%" at 0.43.
+LOW_CONFIDENCE_VERDICT_THRESHOLD = 0.5
+
+
+def _dominant_palette(frame_rgb: np.ndarray, k: int = 3) -> list[str]:
+    """Top-k dominant colors of a frame via a 4-bit-per-channel histogram.
+
+    Measured from the actual pixels (no model, no guessing): each channel is
+    quantized to 16 levels, the 4096-bin histogram is counted, and the k
+    most-populated bins are returned as hex colors at their bin centers.
+    Ties break by bin index so the result is deterministic.
+    """
+    if frame_rgb is None or frame_rgb.size == 0:
+        return []
+    q = (np.clip(frame_rgb, 0, 255).astype(np.int32) >> 4)  # 0..15 per channel
+    bins = (q[..., 0] << 8) | (q[..., 1] << 4) | q[..., 2]
+    counts = np.bincount(bins.ravel(), minlength=4096)
+    order = np.lexsort((np.arange(4096), -counts))  # count desc, bin asc
+    out: list[str] = []
+    for b in order[:k]:
+        if counts[b] <= 0:
+            break
+        r = ((int(b) >> 8) & 0xF) * 16 + 8
+        g = ((int(b) >> 4) & 0xF) * 16 + 8
+        bl = (int(b) & 0xF) * 16 + 8
+        out.append(f"#{r:02X}{g:02X}{bl:02X}")
+    return out
+
+
+def honest_verdict_summary(
+    breakdown_pct: dict[str, float],
+    overall_probs: dict[str, float],
+    overall_conf: float,
+) -> tuple[str, bool, str | None]:
+    """Build the verdict label, refusing to assert a type at low confidence.
+
+    Returns (verdict_summary, verdict_uncertain, runner_up_label).
+    - confidence >= 0.5 (or an already-honest "unknown" top call): the usual
+      "code_motion 100%" / "live 60% + ai_video 40%" wording, unchanged.
+    - confidence < 0.5: "code_motion / static_zoom — uncertain from pixels
+      alone", where the runner-up is the real second-highest class from the
+      duration-weighted overall probabilities — never invented.
+    """
+    if not breakdown_pct:
+        return "indeterminate", False, None
+    top_label = next(iter(breakdown_pct))
+    summary = " + ".join(f"{k} {v:.0f}%" for k, v in list(breakdown_pct.items())[:3])
+    if top_label == "unknown" or overall_conf >= LOW_CONFIDENCE_VERDICT_THRESHOLD:
+        return summary, False, None
+    ranked = sorted(overall_probs.items(), key=lambda kv: -kv[1])
+    runner_up = next((k for k, _ in ranked if k != top_label), None)
+    if runner_up is None:
+        return summary, False, None
+    return f"{top_label} / {runner_up} — uncertain from pixels alone", True, runner_up
+
 
 def _decode_burst_rgb(
     video_path: Path,
@@ -311,6 +369,7 @@ def run_shot_forensics(
             "confidence": conf,
             "needs_visual_review": needs_review,
             "probs": probs,
+            "palette_hex": _dominant_palette(mid_rgb, k=3),
             "metrics": metrics,
             "evidence": evidence,
         })
@@ -326,17 +385,27 @@ def run_shot_forensics(
             for k, v in sorted(winner_dur.items(), key=lambda kv: -kv[1])
         }
         overall_conf = round(conf_sum / total_dur, 2)
+        # Duration-weighted overall class probabilities (for the runner-up in
+        # the low-confidence verdict — measured, not guessed).
+        overall_probs = {
+            k: round(float(v / total_dur), 3) for k, v in weighted_totals.items()
+        }
     else:
         breakdown_pct = {}
         overall_conf = 0.0
+        overall_probs = {k: 0.0 for k in CATEGORIES}
 
     primary_type = next(iter(breakdown_pct.keys()), "unknown")
-    summary_parts = [f"{k} {v:.0f}%" for k, v in list(breakdown_pct.items())[:3]]
-    verdict_line = " + ".join(summary_parts) if summary_parts else "indeterminate"
+    verdict_line, verdict_uncertain, runner_up = honest_verdict_summary(
+        breakdown_pct, overall_probs, overall_conf
+    )
 
     return {
         "primary_type": primary_type,
         "verdict_summary": verdict_line,
+        "verdict_uncertain": verdict_uncertain,
+        "runner_up": runner_up,
+        "overall_probs": overall_probs,
         "overall_confidence": overall_conf,
         "duration_weighted_pct": breakdown_pct,
         "low_confidence_shots": [x["shot_id"] for x in per_shot if x["needs_visual_review"]],
@@ -428,10 +497,20 @@ def fuse_review_probabilities(
         for k, v in sorted(winner_dur.items(), key=lambda kv: -kv[1])
     } if total_dur > 0 else {}
     overall_conf = round(conf_sum / total_dur, 2) if total_dur > 0 else 0.0
-    summary = " + ".join(f"{k} {v:.0f}%" for k, v in list(breakdown_pct.items())[:3]) or "indeterminate"
+    # Duration-weighted overall class probabilities (runner-up source).
+    overall_probs = (
+        {k: round(float(v / total_dur), 3) for k, v in weighted.items()}
+        if total_dur > 0 else {k: 0.0 for k in CATEGORIES}
+    )
+    summary, verdict_uncertain, runner_up = honest_verdict_summary(
+        breakdown_pct, overall_probs, overall_conf
+    )
 
     return {
         "verdict_summary": summary,
+        "verdict_uncertain": verdict_uncertain,
+        "runner_up": runner_up,
+        "overall_probs": overall_probs,
         "overall_confidence": overall_conf,
         "duration_weighted_pct": breakdown_pct,
         "conflicts": conflicts,

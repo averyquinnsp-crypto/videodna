@@ -71,7 +71,28 @@ exec "$VENV_DIR/bin/videodna" "\$@"
 EOF
   chmod +x "$HOME/.local/bin/videodna"
   echo "[VideoDNA] Created shim: $HOME/.local/bin/videodna"
-  if ! command -v videodna >/dev/null 2>&1; then
+  # PATH shadowing check: an older videodna installed elsewhere (e.g.
+  # /usr/local/bin from a previous release) wins over the new shim when it
+  # appears earlier on PATH, so plain `videodna` would keep running the OLD
+  # version after a "successful" install. The old check below only warned
+  # when `videodna` was not found at all, which never happens for upgraders.
+  # Warn LOUDLY instead of silently "succeeding". We never overwrite the
+  # old binary here — removing it is the user's call.
+  local existing
+  existing="$(command -v videodna 2>/dev/null || true)"
+  if [ -n "$existing" ] && [ "$existing" != "$HOME/.local/bin/videodna" ]; then
+    local old_ver="(version unknown)"
+    if "$existing" --version >/dev/null 2>&1; then
+      old_ver="$("$existing" --version 2>/dev/null | head -n 1)"
+    fi
+    echo "[VideoDNA] WARNING: an older videodna is already on your PATH and will SHADOW this install!"
+    echo "  Found: $existing  ($old_ver)"
+    echo "  Plain \`videodna\` will keep running that old copy, NOT the new one at $HOME/.local/bin/videodna."
+    echo "  Fix it with one of:"
+    echo "    sudo rm \"$existing\"                       # remove the old binary"
+    echo "    sudo mv \"$existing\" \"$existing.old\"     # or rename it out of the way"
+    echo "    export PATH=\"\$HOME/.local/bin:\$PATH\"    # or put ~/.local/bin first on PATH"
+  elif [ -z "$existing" ]; then
     echo "[VideoDNA] Note: ~/.local/bin is not on this shell's PATH yet."
     echo "  Run: export PATH=\"\$HOME/.local/bin:\$PATH\"  (or open a new terminal)"
   fi

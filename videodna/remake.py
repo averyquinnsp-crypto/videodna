@@ -4,6 +4,53 @@ from __future__ import annotations
 
 from typing import Any
 
+# v2.0.2: no OCR engine is installed on this machine (no `tesseract` binary;
+# no rapidocr / easyocr / pytesseract importable in the venv or system
+# python — checked 2026-11-21). Shot cards therefore MUST NOT claim any
+# on-screen text: every card states this explicitly until OCR is added.
+# OCR stays a documented gap, never a hard dependency.
+OCR_TEXT_STATUS = "text not extracted (no OCR available)"
+
+# Units for the measured motion value carried on each shot card.
+MOTION_UNITS = "mean abs luma diff per pixel, 0-255 scale, across the burst frames inside the shot"
+
+
+def build_shot_cards(
+    forensics: dict[str, Any],
+    fused: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build one measured content card per shot for the remake plan.
+
+    Every value comes from the pipeline's own measurements — nothing is
+    described or invented:
+    - duration / window: shot detector
+    - production_type / confidence: per-shot forensics (fused when a visual
+      review exists)
+    - palette_hex: top-3 dominant colors of the shot's mid burst frame
+      (4-bit histogram over the real pixels — see forensics._dominant_palette)
+    - motion_mean_frame_diff: mean frame-to-frame luma difference inside
+      the shot (forensics metrics)
+    - on_screen_text: only ever extracted text; with no OCR installed this
+      is always OCR_TEXT_STATUS — a missing measurement, stated as such.
+    """
+    shot_list = (fused or forensics).get("per_shot", [])
+    cards: list[dict[str, Any]] = []
+    for sf in shot_list:
+        m = sf.get("metrics") or {}
+        cards.append({
+            "shot_id": sf["shot_id"],
+            "start": sf["start"],
+            "end": sf["end"],
+            "duration": sf["duration"],
+            "production_type": sf.get("fused_type") or sf.get("predicted_type") or "unknown",
+            "production_confidence": sf.get("fused_confidence") or sf.get("confidence"),
+            "palette_hex": list(sf.get("palette_hex") or []),
+            "motion_mean_frame_diff": m.get("mean_frame_diff"),
+            "motion_units": MOTION_UNITS,
+            "on_screen_text": OCR_TEXT_STATUS,
+        })
+    return cards
+
 
 MODEL_CAPABILITIES: dict[str, dict[str, Any]] = {
     "code_motion": {
@@ -103,6 +150,7 @@ def build_remake_plan(
     return {
         "total_batches": len(batches),
         "batches": batches,
+        "shot_cards": build_shot_cards(forensics, fused=fused),
         "audio_pipeline": audio_plan,
         "color_pipeline": f"Apply auto-generated LUT `{color_dna.get('lut_file')}` ({color_dna.get('grade_style')}) + optional GPU upscale on Kaggle (only when the user asks).",
     }

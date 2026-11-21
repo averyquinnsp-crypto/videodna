@@ -48,6 +48,19 @@ bash install.sh
 
 ---
 
+## What's New in v2.0.2
+
+Patch release fixing every verified weakness from the 2026-11-21 head-to-head on 7 videos (see `CHANGELOG.md` for the full before/after table):
+
+- **Installer warns loudly about PATH shadowing** — an older `videodna` elsewhere on PATH no longer silently wins after install; the warning names the old binary and its version, with three fixes.
+- **BPM octave fold fixed** — 180 BPM click trains read ~180 (was 60.0); 60/120 unchanged.
+- **Motion-graphics shot over-segmentation fixed** — animated text inside one shot no longer counts as new shots (AutoAE promo 4 → 1, Zuckerberg/Meta 3 → 2); real fades/slides/dissolves still detected.
+- **Music no longer called speech** — continuous music without pauses is no longer `speech_plus_bgm`.
+- **Doctor clean** — the phantom `requests` check is gone.
+- **Per-shot cards in the remake plan** — every shot now lists measured duration, transition, dominant colors, and motion level; on-screen text only if actually extracted (no OCR on this machine yet — cards say so honestly).
+- **Honest verdicts below 0.5 confidence** — e.g. `code_motion / static_zoom — uncertain from pixels alone` instead of asserting one type.
+- **Tests** — 61-test suite (26 original + 37 new regression tests), 61 passed + 2 pre-existing skips.
+
 ## What's New in v2.0.1
 
 Patch release on top of v2.0.0's mathematical forensics, smart audio, Bayesian review fusion, remake batch planner, `moments` zoomer, and SRT export. Fixes every issue found in the v2.0.0 review:

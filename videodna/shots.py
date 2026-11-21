@@ -20,6 +20,131 @@ import numpy as np
 
 SCDET_RE = re.compile(r"lavfi\.scd\.score:\s*([0-9.]+),\s*lavfi\.scd\.time:\s*([0-9.]+)")
 
+# v2.0.2 soft-cut guard (layout/background continuity).
+# The frame-diff pass over-segments motion-graphics videos: big animated
+# text/elements moving inside ONE continuous shot produce diff peaks that look
+# like transitions. A real soft transition replaces the layout/background, so
+# for each frame-diff candidate we compare the settled frames on either side:
+#   * GUARD_OFFSET_SEC — how far either side of the candidate the comparison
+#     frames sit (also the settled footage a candidate needs on both sides;
+#     closer to the start/end than this, there is no before/after state to
+#     compare — intro/outro animation and fade-from/to-black live there).
+#   * GUARD_PIXEL_THRESHOLD — per-pixel mean |RGB| change (0-255) that counts
+#     as "this pixel changed".
+#   * GUARD_MIN_CHANGED_FRACTION — if fewer than this fraction of pixels
+#     changed between the before/after frames, the layout/background is
+#     essentially unchanged and the candidate is in-shot animation, not a cut.
+# Tuned on 7 videos (v2.0.2 regression set): at offset 0.75s / threshold 25,
+# in-shot animation scored 0.19-0.29 changed fraction while real transitions
+# scored 0.59-1.00, so 0.45 sits mid-gap. scdet hard cuts are NEVER guarded.
+GUARD_OFFSET_SEC = 0.75
+GUARD_PIXEL_THRESHOLD = 25.0
+GUARD_MIN_CHANGED_FRACTION = 0.45
+
+
+def _changed_fraction(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
+    """Fraction of pixels whose mean |RGB| change exceeds GUARD_PIXEL_THRESHOLD."""
+    diff = np.mean(
+        np.abs(
+            frame_a.reshape(-1, 3).astype(np.float32)
+            - frame_b.reshape(-1, 3).astype(np.float32)
+        ),
+        axis=1,
+    )
+    return float(np.mean(diff > GUARD_PIXEL_THRESHOLD))
+
+
+def _sample_frames_at(
+    video_path: Path,
+    times: list[float],
+    sample_fps: float,
+    sample_w: int,
+    sample_h: int,
+) -> dict[int, np.ndarray]:
+    """Decode once at the frame-diff sample rate and return {frame_index: frame}
+    for the requested times (uint8 RGB arrays). Streams and stops as soon as
+    the last wanted frame has passed, so only the wanted frames are ever held.
+    Returns {} on any ffmpeg failure (callers then keep candidates unguarded).
+    """
+    wanted = {int(round(t * sample_fps)) for t in times}
+    if not wanted:
+        return {}
+    last_idx = max(wanted)
+    frame_bytes = sample_w * sample_h * 3
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", str(video_path),
+        "-vf", f"scale={sample_w}:{sample_h},fps={sample_fps}",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return {}
+    assert proc.stdout is not None
+    found: dict[int, np.ndarray] = {}
+    try:
+        idx = 0
+        while idx <= last_idx:
+            buf = proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
+                break
+            if idx in wanted:
+                found[idx] = np.frombuffer(buf, dtype=np.uint8).copy()
+            idx += 1
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        proc.wait()
+    return found
+
+
+def _guard_soft_cuts(
+    video_path: Path,
+    duration: float,
+    cuts: list[tuple[float, float]],
+    sample_fps: float,
+    sample_w: int,
+    sample_h: int,
+) -> tuple[list[tuple[float, float]], int]:
+    """v2.0.2 layout/background-continuity guard for frame-diff candidates.
+
+    Keeps a candidate only if the settled frames GUARD_OFFSET_SEC before and
+    after it differ across at least GUARD_MIN_CHANGED_FRACTION of pixels.
+    Candidates too close to the start/end to have settled footage on both
+    sides are suppressed (no before/after state exists to compare).
+    Returns (kept_cuts, suppressed_count). On any frame-grab failure the
+    candidates are returned unguarded (fail open — never lose a real cut).
+    """
+    if not cuts:
+        return cuts, 0
+    keep: list[tuple[float, float]] = []
+    need_times: list[float] = []
+    for t, _score in cuts:
+        if GUARD_OFFSET_SEC <= t <= duration - GUARD_OFFSET_SEC:
+            need_times.append(t - GUARD_OFFSET_SEC)
+            need_times.append(t + GUARD_OFFSET_SEC)
+    frames = _sample_frames_at(video_path, need_times, sample_fps, sample_w, sample_h)
+    if len(frames) < len({int(round(t * sample_fps)) for t in need_times}):
+        return cuts, 0
+    suppressed = 0
+    for t, score in cuts:
+        if not (GUARD_OFFSET_SEC <= t <= duration - GUARD_OFFSET_SEC):
+            suppressed += 1
+            continue
+        before = frames.get(int(round((t - GUARD_OFFSET_SEC) * sample_fps)))
+        after = frames.get(int(round((t + GUARD_OFFSET_SEC) * sample_fps)))
+        if before is None or after is None:
+            keep.append((t, score))
+            continue
+        if _changed_fraction(before, after) < GUARD_MIN_CHANGED_FRACTION:
+            suppressed += 1
+            continue
+        keep.append((t, score))
+    return keep, suppressed
+
 
 def _frame_diff_cuts(
     video_path: Path,
@@ -31,8 +156,10 @@ def _frame_diff_cuts(
     """Second-pass cut detection via streaming per-frame pixel differences.
 
     Decodes at low resolution + low fps through a rawvideo pipe (constant memory:
-    only two frames are held at a time). Returns [(time_sec, diff_score)] for
-    detected transitions. Returns [] on any ffmpeg failure.
+    only two frames are held at a time). Returns ([(time_sec, diff_score)],
+    suppressed_count) for detected transitions, where suppressed_count is the
+    number of candidates dropped by the v2.0.2 layout/background-continuity
+    guard. Returns ([], 0) on any ffmpeg failure.
     """
     sample_fps = 6.0 if duration <= 210 else 3.0
     sample_w = 160
@@ -51,7 +178,7 @@ def _frame_diff_cuts(
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
-        return []
+        return [], 0
     assert proc.stdout is not None
 
     diffs: list[float] = []
@@ -75,7 +202,7 @@ def _frame_diff_cuts(
         proc.wait()
 
     if len(diffs) < 3:
-        return []
+        return [], 0
 
     d = np.asarray(diffs, dtype=np.float64)
     # Threshold: twice the video's median frame-to-frame change, with a floor
@@ -109,7 +236,14 @@ def _frame_diff_cuts(
             cuts.append((t, round(float(d[i]), 2)))
         elif d[i] > cuts[-1][1]:
             cuts[-1] = (t, round(float(d[i]), 2))
-    return cuts
+
+    # v2.0.2 guard: drop candidates whose before/after frames show the same
+    # layout/background (in-shot motion-graphics animation, intro/outro).
+    # scdet hard cuts are never touched — this only filters this pass.
+    cuts, suppressed = _guard_soft_cuts(
+        video_path, duration, cuts, sample_fps, sample_w, sample_h
+    )
+    return cuts, suppressed
 
 
 def detect_shots(
@@ -158,8 +292,13 @@ def detect_shots(
 
     # Pass 2: frame-diff (wipes / fades / dissolves scdet misses). scdet wins
     # any tie inside min_gap because it is frame-accurate on hard cuts.
+    # The v2.0.2 guard inside _frame_diff_cuts already dropped in-shot
+    # animation candidates; diff_cut_count counts only the survivors.
     diff_cut_count = 0
-    for t, score in _frame_diff_cuts(video_path, duration, width, height, min_gap):
+    diff_cuts, guard_suppressed = _frame_diff_cuts(
+        video_path, duration, width, height, min_gap
+    )
+    for t, score in diff_cuts:
         if any(abs(t - existing) < min_gap for existing, _ in raw_cuts):
             continue
         raw_cuts.append((t, score))
@@ -262,6 +401,7 @@ def detect_shots(
         "detection": {
             "scdet_cuts": scdet_cut_count,
             "frame_diff_cuts": diff_cut_count,
+            "frame_diff_suppressed_by_guard": guard_suppressed,
             "method": "scdet+frame_diff",
         },
         "shot_count": len(shots),
